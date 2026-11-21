@@ -40,9 +40,9 @@ LOGO_SVG_DATA_URI = (
 )
 
 LOGO_BADGE_HTML = (
-    f'<span class="brand-logo" aria-hidden="true">'
-    f'<img src="{LOGO_SVG_DATA_URI}" alt="Logo" />'
-    f'</span>'
+    '<span class="brand-logo" aria-hidden="true">'
+    '<img src="/static/logo.png" alt="Logo" />'
+    '</span>'
 )
 
 
