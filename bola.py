@@ -17,7 +17,18 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("YOTOQXONA_DB_PATH") or os.path.join(BASE_DIR, "yotoqxona.db")
 UPLOAD_DIR = os.environ.get("YOTOQXONA_UPLOAD_DIR") or os.path.join(BASE_DIR, "static", "uploads")
+TALABALAR_FILE = os.environ.get("YOTOQXONA_TALABALAR_FILE") or os.path.join(BASE_DIR, "talabalar.txt")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+DEFAULT_STUDENTS_TXT = """# Ism Familiya | Sinf | Xona | Sig'im (6 yoki 4)
+Mamadaliyev Shoxbozbek | 9-A | 12c | 4
+Saidov Ruslan | 9-A | 12c | 4
+Azizov Muhammadabdulloh | 5-A | 12c | 4
+Egamberdiyev Inomjon | 8-A | 12c | 4
+G'aybullayev Oybek | 9-B | 6c | 6
+Lutfiddinov Mirobidjon | 9-A | 12c | 6
+lutfiddinov Mirhodiy | 10-A | 12c | 6
+"""
 
 PINS = {
     "ustoz": os.environ.get("PIN_USTOZ", "1111"),
@@ -29,7 +40,7 @@ MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
 failed_logins = {}
 
-LOGO_SVG_DATA_URI = (
+FALLBACK_LOGO_SVG = (
     "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
     "%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E"
     "%3Cstop offset='0%25' stop-color='%232563eb'/%3E"
@@ -41,7 +52,7 @@ LOGO_SVG_DATA_URI = (
 
 LOGO_BADGE_HTML = (
     '<span class="brand-logo" aria-hidden="true">'
-    '<img src="/static/logo.png" alt="Logo" />'
+    f'<img src="/static/logo.png?v=2" alt="Logo" onerror="this.onerror=null;this.src=\'{FALLBACK_LOGO_SVG}\';" />'
     '</span>'
 )
 
@@ -132,8 +143,72 @@ def detect_device_mode():
     return "desktop"
 
 
+def ensure_talabalar_txt_exists():
+    if not os.path.exists(TALABALAR_FILE):
+        with open(TALABALAR_FILE, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_STUDENTS_TXT)
+
+
+def sync_students_from_txt(db):
+    ensure_talabalar_txt_exists()
+    cur = db.cursor()
+    with open(TALABALAR_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parts = [p.strip() for p in raw.split("|")]
+            if len(parts) < 3:
+                continue
+            full_name = parts[0]
+            class_name = parts[1]
+            room_code = parts[2].lower()
+            capacity = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 6
+
+            room = cur.execute(
+                "SELECT id, capacity FROM rooms WHERE LOWER(code) = ? AND capacity = ?",
+                (room_code, capacity),
+            ).fetchone()
+            if not room:
+                room = cur.execute(
+                    "SELECT id, capacity FROM rooms WHERE LOWER(code) = ? ORDER BY capacity DESC",
+                    (room_code,),
+                ).fetchone()
+            if not room:
+                continue
+
+            exists = cur.execute(
+                "SELECT id FROM students WHERE full_name = ? AND class_name = ? AND room_id = ?",
+                (full_name, class_name, room["id"]),
+            ).fetchone()
+            occ = cur.execute(
+                "SELECT COUNT(*) AS c FROM students WHERE room_id = ?",
+                (room["id"],),
+            ).fetchone()["c"]
+            if not exists and occ < room["capacity"]:
+                cur.execute(
+                    "INSERT INTO students (full_name, class_name, room_id) VALUES (?, ?, ?)",
+                    (full_name, class_name, room["id"]),
+                )
+    db.commit()
+
+
+def rewrite_talabalar_txt(db):
+    rows = db.execute("""
+        SELECT s.full_name, s.class_name, r.code, r.capacity
+        FROM students s
+        JOIN rooms r ON s.room_id = r.id
+        ORDER BY CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name
+    """).fetchall()
+    with open(TALABALAR_FILE, "w", encoding="utf-8") as f:
+        f.write("# Ism Familiya | Sinf | Xona | Sig'im (6 yoki 4)\n")
+        for r in rows:
+            f.write(f"{r['full_name']} | {r['class_name']} | {r['code']} | {r['capacity']}\n")
+
+
 def init_db():
     db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
     cur = db.cursor()
 
     cur.execute("""
@@ -219,29 +294,9 @@ def init_db():
             cur.execute("INSERT OR IGNORE INTO rooms (code, sub_label, capacity) VALUES (?, '6 kishilik xona', 6)", (code,))
             cur.execute("INSERT OR IGNORE INTO rooms (code, sub_label, capacity) VALUES (?, '4 kishilik xona', 4)", (code,))
 
-    cur.execute("SELECT COUNT(*) FROM students")
-    if cur.fetchone()[0] == 0:
-        r1_6 = cur.execute("SELECT id FROM rooms WHERE code = '1c' AND sub_label = '6 kishilik xona'").fetchone()[0]
-        r1_4 = cur.execute("SELECT id FROM rooms WHERE code = '1c' AND sub_label = '4 kishilik xona'").fetchone()[0]
-        r2_6 = cur.execute("SELECT id FROM rooms WHERE code = '2c' AND sub_label = '6 kishilik xona'").fetchone()[0]
-        r3_4 = cur.execute("SELECT id FROM rooms WHERE code = '3c' AND sub_label = '4 kishilik xona'").fetchone()[0]
-
-        sample_students = [
-            ("Ali Valiyev", "7-A sinf", r1_6),
-            ("Bekzod Karimov", "7-A sinf", r1_6),
-            ("Jasur Tursunov", "8-B sinf", r1_6),
-            ("Sardor Alimov", "8-B sinf", r1_4),
-            ("Azizbek Sobirov", "9-A sinf", r1_4),
-            ("Dostonbek Qodirov", "9-A sinf", r2_6),
-            ("Sherzod Xolmatov", "10-A sinf", r2_6),
-            ("Javohir Abdullayev", "10-B sinf", r3_4),
-        ]
-        cur.executemany(
-            "INSERT INTO students (full_name, class_name, room_id) VALUES (?, ?, ?)",
-            sample_students
-        )
-
     db.commit()
+    sync_students_from_txt(db)
+    rewrite_talabalar_txt(db)
     db.close()
 
 
@@ -264,6 +319,8 @@ def ensure_day_rollover():
         cur.execute("UPDATE settings SET value = ? WHERE key = 'last_seen_date'", (cur_date,))
         cur.execute("UPDATE supervisors SET on_time = 0, arrived_at = ''")
         db.commit()
+
+    sync_students_from_txt(db)
 
     students = cur.execute("SELECT id FROM students").fetchall()
     for st in students:
@@ -694,7 +751,7 @@ def render_page(page_name):
                 </div>
                 <div>
                   <label class="field-label">Sinf</label>
-                  <input type="text" name="class_name" class="input" placeholder="Masalan: 7-A sinf" required />
+                  <input type="text" name="class_name" class="input" placeholder="Masalan: 9-A sinf" required />
                 </div>
                 <div>
                   <label class="field-label">Xona (1c-12c)</label>
@@ -850,7 +907,7 @@ def render_page(page_name):
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Yotoqxona Nazorati</title>
-  <link rel="icon" type="image/svg+xml" href="{LOGO_SVG_DATA_URI}" />
+  <link rel="icon" type="image/png" href="/static/logo.png?v=2" />
   <style>
     :root {{
       --bg: #eef2f7;
@@ -1385,7 +1442,8 @@ def add_student():
                 (full_name, class_name, room_id)
             )
             db.commit()
-            flash("O'quvchi qo'shildi.", "success")
+            rewrite_talabalar_txt(db)
+            flash("O'quvchi qo'shildi va talabalar.txt ga saqlandi.", "success")
         else:
             flash("Tanlangan xona to'lgan.", "error")
     return redirect(url_for("students_page", date=work_date))
@@ -1400,7 +1458,8 @@ def delete_student(student_id):
     db = get_db()
     db.execute("DELETE FROM students WHERE id = ?", (student_id,))
     db.commit()
-    flash("O'quvchi o'chirildi.", "success")
+    rewrite_talabalar_txt(db)
+    flash("O'quvchi o'chirildi va talabalar.txt yangilandi.", "success")
     return redirect(url_for("students_page", date=work_date))
 
 
