@@ -29,6 +29,22 @@ MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
 failed_logins = {}
 
+LOGO_SVG_DATA_URI = (
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+    "%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E"
+    "%3Cstop offset='0%25' stop-color='%232563eb'/%3E"
+    "%3Cstop offset='100%25' stop-color='%230ea5e9'/%3E%3C/linearGradient%3E%3C/defs%3E"
+    "%3Crect width='64' height='64' rx='18' fill='url(%23g)'/%3E"
+    "%3Cpath d='M16 33L32 19l16 14v15H38V37H26v11H16V33z' fill='%23ffffff'/%3E"
+    "%3C/svg%3E"
+)
+
+LOGO_BADGE_HTML = (
+    f'<span class="brand-logo" aria-hidden="true">'
+    f'<img src="{LOGO_SVG_DATA_URI}" alt="Logo" />'
+    f'</span>'
+)
+
 
 def esc(val):
     return html.escape(str(val or ""), quote=True)
@@ -268,15 +284,6 @@ def current_role():
     return session.get("role")
 
 
-def active_theme():
-    db = get_db()
-    if session.get("manual_theme") in ("day", "night"):
-        return session["manual_theme"]
-    row = db.execute("SELECT value FROM settings WHERE key = 'auto_theme'").fetchone()
-    auto_enabled = (row["value"] == "1") if row else True
-    return auto_theme_by_hour() if auto_enabled else "day"
-
-
 def role_home_url(role):
     if role == "oshpaz":
         return url_for("chef_page")
@@ -285,6 +292,29 @@ def role_home_url(role):
     if role == "ustoz":
         return url_for("attendance_page")
     return url_for("login_page")
+
+
+def require_login(roles=None, is_api=False):
+    role = current_role()
+    if not role:
+        if is_api:
+            return jsonify({"ok": False, "error": "Avval tizimga kiring"}), 401
+        return redirect(url_for("login_page"))
+    if roles and role not in roles:
+        if is_api:
+            return jsonify({"ok": False, "error": "Ruxsat berilmagan"}), 403
+        flash("Sizda bu bo'limga kirish huquqi yo'q.", "error")
+        return redirect(role_home_url(role))
+    return None
+
+
+def active_theme():
+    db = get_db()
+    if session.get("manual_theme") in ("day", "night"):
+        return session["manual_theme"]
+    row = db.execute("SELECT value FROM settings WHERE key = 'auto_theme'").fetchone()
+    auto_enabled = (row["value"] == "1") if row else True
+    return auto_theme_by_hour() if auto_enabled else "day"
 
 
 def render_page(page_name):
@@ -417,8 +447,13 @@ def render_page(page_name):
         body_html = f"""
         <section class="login-wrapper">
           <div class="glass-card login-card">
-            <h1>Tizimga kirish</h1>
-            <p class="muted">Rolni tanlang va PIN-kodni kiriting.</p>
+            <div class="login-brand">
+              {LOGO_BADGE_HTML}
+              <div>
+                <h1>Tizimga kirish</h1>
+                <p class="muted">Rolni tanlang va PIN-kodni kiriting.</p>
+              </div>
+            </div>
             <form method="POST" action="{url_for('login')}">
               <label class="field-label">Rolni tanlang</label>
               <div class="role-select-grid">
@@ -765,8 +800,11 @@ def render_page(page_name):
         body_html = f"""
         <header class="topbar glass-card">
           <div class="brand-area">
-            <div class="brand-title">Yotoqxona Nazorati</div>
-            <div class="brand-sub">{esc(format_uz_date(selected_date))} &middot; Navbatchi: <strong>{duty_banner_text}</strong></div>
+            {LOGO_BADGE_HTML}
+            <div>
+              <div class="brand-title">Yotoqxona Nazorati</div>
+              <div class="brand-sub">{esc(format_uz_date(selected_date))} &middot; Navbatchi: <strong>{duty_banner_text}</strong></div>
+            </div>
           </div>
           <div class="top-actions">
             <form method="GET" action="{url_for(endpoint_name)}" class="inline-form date-form">
@@ -812,6 +850,7 @@ def render_page(page_name):
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Yotoqxona Nazorati</title>
+  <link rel="icon" type="image/svg+xml" href="{LOGO_SVG_DATA_URI}" />
   <style>
     :root {{
       --bg: #eef2f7;
@@ -855,6 +894,13 @@ def render_page(page_name):
       gap: 12px;
       margin-bottom: 12px;
     }}
+    .brand-area {{ display: flex; align-items: center; gap: 12px; }}
+    .brand-logo {{
+      width: 42px; height: 42px; border-radius: 14px; overflow: hidden;
+      display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+      box-shadow: 0 6px 16px rgba(37, 99, 235, 0.22);
+    }}
+    .brand-logo img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
     .brand-title {{ font-size: 20px; font-weight: 700; }}
     .brand-sub, .muted {{ color: var(--muted); font-size: 13px; }}
     .top-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }}
@@ -941,6 +987,8 @@ def render_page(page_name):
     .alert-success {{ background: rgba(22, 163, 74, 0.15); color: var(--ok); }}
     .login-wrapper {{ display: flex; justify-content: center; padding: 32px 0; }}
     .login-card {{ width: 100%; max-width: 420px; }}
+    .login-brand {{ display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }}
+    .login-brand h1 {{ margin: 0 0 2px; font-size: 22px; }}
     .field-label {{ display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }}
     .role-select-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }}
     .role-option {{
@@ -1165,11 +1213,17 @@ def logout():
 
 @app.route("/attendance")
 def attendance_page():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     return render_page("attendance")
 
 
 @app.route("/api/attendance", methods=["POST"])
 def api_attendance():
+    guard = require_login(["ustoz", "superadmin"], is_api=True)
+    if guard:
+        return guard
     ensure_day_rollover()
     data = request.get_json(silent=True) or request.form
     student_id = data.get("student_id")
@@ -1198,11 +1252,17 @@ def api_attendance():
 
 @app.route("/phones")
 def phones_page():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     return render_page("phones")
 
 
 @app.route("/phones/set-status", methods=["POST"])
 def set_phone_status():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     ensure_day_rollover()
     student_id = request.form.get("student_id")
     work_date = request.form.get("work_date") or today_str()
@@ -1228,6 +1288,9 @@ def set_phone_status():
 
 @app.route("/phones/set-all-not-given", methods=["POST"])
 def set_all_phones_not_given():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     ensure_day_rollover()
     work_date = request.form.get("work_date") or today_str()
     db = get_db()
@@ -1251,6 +1314,9 @@ def set_all_phones_not_given():
 
 @app.route("/phones/save-photo", methods=["POST"])
 def save_phone_photo():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     ensure_day_rollover()
     student_id = request.form.get("student_id")
     work_date = request.form.get("work_date") or today_str()
@@ -1292,11 +1358,17 @@ def save_phone_photo():
 
 @app.route("/students")
 def students_page():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     return render_page("students")
 
 
 @app.route("/students/add", methods=["POST"])
 def add_student():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     ensure_day_rollover()
     work_date = request.form.get("work_date") or today_str()
     full_name = (request.form.get("full_name") or "").strip()
@@ -1321,6 +1393,9 @@ def add_student():
 
 @app.route("/students/delete/<int:student_id>", methods=["POST"])
 def delete_student(student_id):
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     work_date = request.form.get("work_date") or today_str()
     db = get_db()
     db.execute("DELETE FROM students WHERE id = ?", (student_id,))
@@ -1331,26 +1406,33 @@ def delete_student(student_id):
 
 @app.route("/rooms")
 def rooms_page():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
     return render_page("rooms")
 
 
 @app.route("/chef")
 def chef_page():
+    guard = require_login(["oshpaz", "ustoz", "superadmin"])
+    if guard:
+        return guard
     return render_page("chef")
 
 
 @app.route("/superadmin")
 def superadmin_page():
-    if current_role() != "superadmin":
-        flash("Bu bo'lim faqat Super Admin uchun.", "error")
-        return redirect(url_for("login_page"))
+    guard = require_login(["superadmin"])
+    if guard:
+        return guard
     return render_page("superadmin")
 
 
 @app.route("/superadmin/supervisor", methods=["POST"])
 def superadmin_update_supervisor():
-    if current_role() != "superadmin":
-        return redirect(url_for("login_page"))
+    guard = require_login(["superadmin"])
+    if guard:
+        return guard
     slot_number = request.form.get("slot_number")
     teacher_name = (request.form.get("teacher_name") or "").strip()
     shift_start = (request.form.get("shift_start") or "").strip()
@@ -1370,8 +1452,9 @@ def superadmin_update_supervisor():
 
 @app.route("/superadmin/ontime", methods=["POST"])
 def superadmin_toggle_ontime():
-    if current_role() != "superadmin":
-        return redirect(url_for("login_page"))
+    guard = require_login(["superadmin"])
+    if guard:
+        return guard
     slot_number = request.form.get("slot_number")
     on_time = 1 if request.form.get("on_time") == "1" else 0
     work_date = request.form.get("work_date") or today_str()
@@ -1388,8 +1471,9 @@ def superadmin_toggle_ontime():
 
 @app.route("/superadmin/auto-theme", methods=["POST"])
 def superadmin_toggle_auto_theme():
-    if current_role() != "superadmin":
-        return redirect(url_for("login_page"))
+    guard = require_login(["superadmin"])
+    if guard:
+        return guard
     val = "1" if request.form.get("auto_theme") == "1" else "0"
     work_date = request.form.get("work_date") or today_str()
     db = get_db()
@@ -1403,8 +1487,11 @@ def superadmin_toggle_auto_theme():
 
 @app.route("/settings/theme", methods=["POST"])
 def set_theme():
+    guard = require_login(["ustoz", "oshpaz", "superadmin"])
+    if guard:
+        return guard
     theme = request.form.get("theme")
-    next_url = request.form.get("next_url") or url_for("attendance_page")
+    next_url = request.form.get("next_url") or role_home_url(current_role())
     if theme in ("day", "night"):
         session["manual_theme"] = theme
     return redirect(next_url)
@@ -1412,8 +1499,11 @@ def set_theme():
 
 @app.route("/settings/device", methods=["POST"])
 def set_device():
+    guard = require_login(["ustoz", "oshpaz", "superadmin"])
+    if guard:
+        return guard
     dev = request.form.get("device_mode")
-    next_url = request.form.get("next_url") or url_for("attendance_page")
+    next_url = request.form.get("next_url") or role_home_url(current_role())
     if dev in ("phone", "desktop"):
         session["device_mode"] = dev
     return redirect(next_url)
