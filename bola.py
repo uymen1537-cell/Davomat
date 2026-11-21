@@ -40,7 +40,7 @@ MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
 failed_logins = {}
 
-FALLBACK_LOGO_SVG = (
+LOGO_DATA_URI = (
     "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
     "%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E"
     "%3Cstop offset='0%25' stop-color='%232563eb'/%3E"
@@ -52,7 +52,7 @@ FALLBACK_LOGO_SVG = (
 
 LOGO_BADGE_HTML = (
     '<span class="brand-logo" aria-hidden="true">'
-    f'<img src="/static/logo.png?v=2" alt="Logo" onerror="this.onerror=null;this.src=\'{FALLBACK_LOGO_SVG}\';" />'
+    f'<img src="{LOGO_DATA_URI}" alt="Logo" />'
     '</span>'
 )
 
