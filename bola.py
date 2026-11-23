@@ -1,10 +1,13 @@
 import os
+import io
 import time
 import html
 import sqlite3
 import base64
+import zipfile
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
+from xml.sax.saxutils import escape as xml_escape
 from flask import (
     Flask, request, redirect, url_for, session, flash,
     get_flashed_messages, g, jsonify, Response
@@ -229,6 +232,143 @@ def normalize_phone_status(val):
         "O'quvchi bermadi": "O'quvchi bermadi",
     }
     return mapping.get(v, "")
+
+
+def col_letter(idx_1based):
+    letters = ""
+    n = idx_1based
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths):
+    """Yagona tashqi kutubxonasiz to'g'ri formatlangan .xlsx fayl yaratadi."""
+    # style index: 0 = default, 1 = title bold, 2 = summary muted, 3 = table header bold+fill+border, 4 = data cell border, 5 = number cell border
+    sheet_rows_xml = []
+
+    def cell_xml(r_idx, c_idx, val, style_idx=4, is_num=False):
+        ref = f"{col_letter(c_idx)}{r_idx}"
+        if is_num and isinstance(val, (int, float)):
+            return f'<c r="{ref}" s="{style_idx}"><v>{val}</v></c>'
+        s_val = xml_escape(str(val if val is not None else ""))
+        return f'<c r="{ref}" s="{style_idx}" t="inlineStr"><is><t xml:space="preserve">{s_val}</t></is></c>'
+
+    # Row 1: Title
+    sheet_rows_xml.append(
+        f'<row r="1" ht="24" customHeight="1">{cell_xml(1, 1, title_line, style_idx=1)}</row>'
+    )
+    # Row 2: Summary
+    sheet_rows_xml.append(
+        f'<row r="2" ht="20" customHeight="1">{cell_xml(2, 1, summary_line, style_idx=2)}</row>'
+    )
+    # Row 3: Blank spacer
+    sheet_rows_xml.append('<row r="3" ht="10" customHeight="1"/>')
+
+    # Row 4: Table headers
+    hdr_cells = "".join(cell_xml(4, c + 1, h, style_idx=3) for c, h in enumerate(headers))
+    sheet_rows_xml.append(f'<row r="4" ht="24" customHeight="1">{hdr_cells}</row>')
+
+    # Data rows starting at row 5
+    for offset, r_vals in enumerate(rows_data):
+        r_num = 5 + offset
+        cells = []
+        for c_idx, val in enumerate(r_vals, start=1):
+            if c_idx == 1 and isinstance(val, int):
+                cells.append(cell_xml(r_num, c_idx, val, style_idx=5, is_num=True))
+            else:
+                cells.append(cell_xml(r_num, c_idx, val, style_idx=4, is_num=False))
+        sheet_rows_xml.append(f'<row r="{r_num}" ht="20" customHeight="1">{"".join(cells)}</row>')
+
+    cols_xml = "".join(
+        f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>'
+        for i, w in enumerate(col_widths)
+    )
+
+    last_col = col_letter(len(headers))
+    last_row = max(5, 4 + len(rows_data))
+
+    worksheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetViews>
+    <sheetView workbookViewId="0" showGridLines="1"/>
+  </sheetViews>
+  <cols>{cols_xml}</cols>
+  <sheetData>{"".join(sheet_rows_xml)}</sheetData>
+  <autoFilter ref="A4:{last_col}{last_row}"/>
+  <pageSetup orientation="landscape" fitToWidth="1" fitToHeight="0"/>
+</worksheet>"""
+
+    styles_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="3">
+    <font><sz val="11"/><name val="Calibri"/><color theme="1"/></font>
+    <font><b/><sz val="14"/><name val="Calibri"/><color theme="1"/></font>
+    <font><b/><sz val="11"/><name val="Calibri"/><color rgb="FFFFFFFF"/></font>
+  </fonts>
+  <fills count="3">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FF2563EB"/><bgColor indexed="64"/></patternFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border>
+      <left style="thin"><color rgb="FFCBD5E1"/></left>
+      <right style="thin"><color rgb="FFCBD5E1"/></right>
+      <top style="thin"><color rgb="FFCBD5E1"/></top>
+      <bottom style="thin"><color rgb="FFCBD5E1"/></bottom>
+      <diagonal/>
+    </border>
+  </borders>
+  <cellXfs count="6">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyFont="1"/>
+    <xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyFont="1"/>
+    <xf numFmtId="0" fontId="2" fillId="2" borderId="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="center"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+  </cellXfs>
+</styleSheet>"""
+
+    workbook_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Davomat" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"""
+
+    workbook_rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"""
+
+    root_rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+
+    content_types_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>"""
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml.encode("utf-8"))
+        zf.writestr("_rels/.rels", root_rels_xml.encode("utf-8"))
+        zf.writestr("xl/workbook.xml", workbook_xml.encode("utf-8"))
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml.encode("utf-8"))
+        zf.writestr("xl/styles.xml", styles_xml.encode("utf-8"))
+        zf.writestr("xl/worksheets/sheet1.xml", worksheet_xml.encode("utf-8"))
+    return buf.getvalue()
 
 
 def init_db():
@@ -683,7 +823,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Katta Excel Davomat Jadvali ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Har kun uchun davomat alohida toza boshlanadi. Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing.</p>
+                  <p class="muted">Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing — sahifa qayta ochilsa ham bazadan saqlangan holat o'chmaydi.</p>
                 </div>
                 <div class="filter-bar">
                   <form method="GET" action="{att_form_url}" class="filter-bar">
@@ -697,7 +837,7 @@ def render_page(page_name):
                       {room_opts}
                     </select>
                   </form>
-                  <a href="{export_url}" class="btn btn-soft btn-sm">Excel yuklab olish</a>
+                  <a href="{export_url}" class="btn btn-soft btn-sm">Excel yuklab olish (.xlsx)</a>
                 </div>
               </div>
 
@@ -715,7 +855,7 @@ def render_page(page_name):
               <div class="bulk-save-bar">
                 <span id="att-unmarked-summary" class="muted">Holatni belgilab, saqlang.</span>
                 <div class="bulk-save-actions">
-                  <a href="{export_url}" class="btn btn-outline">Excel yuklab olish</a>
+                  <a href="{export_url}" class="btn btn-outline">Excel yuklab olish (.xlsx)</a>
                   <button type="button" id="btn-save-all-attendance" class="btn btn-primary" onclick="saveAllAttendance()">Hammasini saqlash</button>
                 </div>
               </div>
@@ -1479,7 +1619,7 @@ def render_page(page_name):
         }});
         const data = await res.json().catch(() => ({{}}));
         if (res.ok && data.ok) {{
-          showAttendanceFeedback("success", `${{items.length}} nafar o'quvchi davomati muvaffaqiyatli saqlandi.`);
+          showAttendanceFeedback("success", `${{items.length}} nafar o'quvchi davomati bazaga saqlandi. Sahifani qayta ochsangiz ham o'chmaydi.`);
           refreshUnmarkedSummary();
         }} else {{
           showAttendanceFeedback("error", data.error || "Saqlashda xatolik yuz berdi.");
@@ -1663,6 +1803,7 @@ def attendance_page():
 
 
 @app.route("/attendance/export.xls")
+@app.route("/attendance/export.xlsx")
 def export_attendance_excel():
     guard = require_login(["ustoz", "superadmin"])
     if guard:
@@ -1688,7 +1829,10 @@ def export_attendance_excel():
     absent_c = sum(1 for st in students if st["status"] == "-")
     unmarked_c = len(students) - present_c - absent_c
 
-    body_rows = []
+    headers = ["#", "Ism-familiya", "Sinf", "Xona", "Davomat", "Sabab", "Telefon holati"]
+    col_widths = [6, 28, 12, 16, 15, 24, 24]
+
+    rows_data = []
     for i, st in enumerate(students, start=1):
         st_label = "Bor (+)" if st["status"] == "+" else ("Yo'q (-)" if st["status"] == "-" else "Belgilanmagan")
         reason_str = ""
@@ -1697,57 +1841,24 @@ def export_attendance_excel():
         phone_str = st["phone_status"] or "Belgilanmagan"
         if st["phone_time"]:
             phone_str = f"{phone_str} ({st['phone_time']})"
-        body_rows.append(f"""
-        <tr>
-          <td>{i}</td>
-          <td>{html.escape(st["full_name"])}</td>
-          <td>{html.escape(st["class_name"])}</td>
-          <td>{html.escape(st["room_code"])} ({st["room_capacity"]} k.)</td>
-          <td>{html.escape(st_label)}</td>
-          <td>{html.escape(reason_str)}</td>
-          <td>{html.escape(phone_str)}</td>
-        </tr>
-        """)
+        rows_data.append([
+            i,
+            st["full_name"],
+            st["class_name"],
+            f"{st['room_code']} ({st['room_capacity']} k.)",
+            st_label,
+            reason_str,
+            phone_str,
+        ])
 
-    xls_html = f"""<!DOCTYPE html>
-<html lang="uz">
-<head>
-  <meta charset="UTF-8" />
-  <style>
-    table {{ border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 12pt; }}
-    th, td {{ border: 1px solid #333; padding: 6px 8px; text-align: left; }}
-    th {{ background: #dbeafe; font-weight: bold; }}
-    .meta {{ margin-bottom: 10px; font-family: Arial, sans-serif; }}
-  </style>
-</head>
-<body>
-  <div class="meta">
-    <h3>Yotoqxona Davomat Hisoboti — {html.escape(format_uz_date(selected_date))}</h3>
-    <p>Jami: <strong>{len(students)}</strong> | Bor (+): <strong>{present_c}</strong> | Yo'q (-): <strong>{absent_c}</strong> | Belgilanmagan: <strong>{unmarked_c}</strong></p>
-  </div>
-  <table>
-    <thead>
-      <tr>
-        <th>#</th>
-        <th>Ism-familiya</th>
-        <th>Sinf</th>
-        <th>Xona</th>
-        <th>Davomat</th>
-        <th>Sabab</th>
-        <th>Telefon holati</th>
-      </tr>
-    </thead>
-    <tbody>
-      {"".join(body_rows)}
-    </tbody>
-  </table>
-</body>
-</html>
-"""
-    fname = f"davomat_{selected_date}.xls"
+    title_line = f"Yotoqxona Davomat Hisoboti — {format_uz_date(selected_date)}"
+    summary_line = f"Jami: {len(students)} | Bor (+): {present_c} | Yo'q (-): {absent_c} | Belgilanmagan: {unmarked_c}"
+    xlsx_bytes = build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths)
+
+    fname = f"davomat_{selected_date}.xlsx"
     return Response(
-        xls_html.encode("utf-8"),
-        mimetype="application/vnd.ms-excel; charset=utf-8",
+        xlsx_bytes,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{fname}"; filename*=UTF-8\'\'{quote(fname)}'},
     )
 
