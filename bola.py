@@ -2,6 +2,7 @@ import os
 import io
 import time
 import html
+import calendar
 import sqlite3
 import base64
 import zipfile
@@ -146,20 +147,27 @@ def today_str():
     return now_uz().strftime("%Y-%m-%d")
 
 
+UZ_MONTHS = [
+    "", "Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun",
+    "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr"
+]
+
+
 def format_uz_date(iso_date):
     try:
         dt = datetime.strptime(iso_date, "%Y-%m-%d")
     except ValueError:
         dt = now_uz()
-    months = [
-        "", "Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun",
-        "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr"
-    ]
     weekdays = [
         "Dushanba", "Seshanba", "Chorshanba", "Payshanba",
         "Juma", "Shanba", "Yakshanba"
     ]
-    return f"{dt.day}-{months[dt.month]} {dt.year}-yil, {weekdays[dt.weekday()]}"
+    return f"{dt.day}-{UZ_MONTHS[dt.month]} {dt.year}-yil, {weekdays[dt.weekday()]}"
+
+
+def format_uz_month(year_num, month_num):
+    m_name = UZ_MONTHS[month_num] if 1 <= month_num <= 12 else str(month_num)
+    return f"{m_name} {year_num}-yil"
 
 
 def auto_theme_by_hour():
@@ -261,7 +269,8 @@ def col_letter(idx_1based):
     return letters
 
 
-def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths):
+def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths, center_cols=None):
+    center_set = set(center_cols or [])
     sheet_rows_xml = []
 
     def cell_xml(r_idx, c_idx, val, style_idx=4, is_num=False):
@@ -279,17 +288,23 @@ def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths):
     )
     sheet_rows_xml.append('<row r="3" ht="10" customHeight="1"/>')
 
-    hdr_cells = "".join(cell_xml(4, c + 1, h, style_idx=3) for c, h in enumerate(headers))
+    hdr_cells = "".join(
+        cell_xml(4, c + 1, h, style_idx=6 if (c + 1) in center_set else 3)
+        for c, h in enumerate(headers)
+    )
     sheet_rows_xml.append(f'<row r="4" ht="24" customHeight="1">{hdr_cells}</row>')
 
     for offset, r_vals in enumerate(rows_data):
         r_num = 5 + offset
         cells = []
         for c_idx, val in enumerate(r_vals, start=1):
-            if c_idx == 1 and isinstance(val, int):
-                cells.append(cell_xml(r_num, c_idx, val, style_idx=5, is_num=True))
+            is_centered = c_idx in center_set
+            if isinstance(val, int) and not isinstance(val, bool):
+                st_i = 5 if (c_idx == 1 or is_centered) else 4
+                cells.append(cell_xml(r_num, c_idx, val, style_idx=st_i, is_num=True))
             else:
-                cells.append(cell_xml(r_num, c_idx, val, style_idx=4, is_num=False))
+                st_i = 5 if is_centered else 4
+                cells.append(cell_xml(r_num, c_idx, val, style_idx=st_i, is_num=False))
         sheet_rows_xml.append(f'<row r="{r_num}" ht="20" customHeight="1">{"".join(cells)}</row>')
 
     cols_xml = "".join(
@@ -333,13 +348,14 @@ def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths):
       <diagonal/>
     </border>
   </borders>
-  <cellXfs count="6">
+  <cellXfs count="7">
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyFont="1"/>
     <xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/>
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyFont="1"/>
     <xf numFmtId="0" fontId="2" fillId="2" borderId="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="center"/></xf>
     <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>
     <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="2" fillId="2" borderId="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
   </cellXfs>
 </styleSheet>"""
 
@@ -775,9 +791,16 @@ def render_page(page_name):
                 f'<option value="{esc(rc)}" {"selected" if room_code_filter == rc else ""}>{esc(rc)}</option>'
                 for rc in room_codes
             )
-            export_url = url_for(
+            export_day_url = url_for(
                 "export_attendance_excel_xlsx",
                 date=selected_date,
+                class_name=class_filter,
+                room_code=room_code_filter,
+            )
+            sel_month_str = selected_date[:7]
+            export_month_url = url_for(
+                "export_attendance_monthly_xlsx",
+                month=sel_month_str,
                 class_name=class_filter,
                 room_code=room_code_filter,
             )
@@ -834,7 +857,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Katta Excel Davomat Jadvali ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing — baza alohida papkada saqlanadi va kod yangilanganda o'chmaydi.</p>
+                  <p class="muted">Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing — 1 kunlik yoki 1 oylik (.xlsx) hisobotni yuklab olishingiz mumkin.</p>
                 </div>
                 <div class="filter-bar">
                   <form method="GET" action="{att_form_url}" class="filter-bar">
@@ -848,7 +871,8 @@ def render_page(page_name):
                       {room_opts}
                     </select>
                   </form>
-                  <a href="{export_url}" class="btn btn-soft btn-sm">Excel yuklab olish (.xlsx)</a>
+                  <a href="{export_day_url}" class="btn btn-soft btn-sm">Kunlik Excel (.xlsx)</a>
+                  <a href="{export_month_url}" class="btn btn-primary btn-sm">1 oylik Excel ({esc(sel_month_str)})</a>
                 </div>
               </div>
 
@@ -866,7 +890,8 @@ def render_page(page_name):
               <div class="bulk-save-bar">
                 <span id="att-unmarked-summary" class="muted">Holatni belgilab, saqlang.</span>
                 <div class="bulk-save-actions">
-                  <a href="{export_url}" class="btn btn-outline">Excel yuklab olish (.xlsx)</a>
+                  <a href="{export_day_url}" class="btn btn-outline">Kunlik Excel (.xlsx)</a>
+                  <a href="{export_month_url}" class="btn btn-soft">1 oylik Excel ({esc(sel_month_str)})</a>
                   <button type="button" id="btn-save-all-attendance" class="btn btn-primary" onclick="saveAllAttendance()">Hammasini saqlash</button>
                 </div>
               </div>
@@ -1864,9 +1889,121 @@ def export_attendance_excel_xlsx():
 
     title_line = f"Yotoqxona Davomat Hisoboti — {format_uz_date(selected_date)}"
     summary_line = f"Jami: {len(students)} | Bor (+): {present_c} | Yo'q (-): {absent_c} | Belgilanmagan: {unmarked_c}"
-    xlsx_bytes = build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths)
+    xlsx_bytes = build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths, center_cols=[1, 3, 4, 5])
 
     fname = f"davomat_{selected_date}.xlsx"
+    return Response(
+        xlsx_bytes,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"; filename*=UTF-8\'\'{quote(fname)}',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.route("/attendance/export-monthly.xlsx")
+def export_attendance_monthly_xlsx():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
+    ensure_day_rollover()
+    db = get_db()
+
+    month_raw = (request.args.get("month") or today_str()[:7]).strip()
+    try:
+        ym_dt = datetime.strptime(month_raw, "%Y-%m")
+    except ValueError:
+        ym_dt = datetime.strptime(today_str()[:7], "%Y-%m")
+
+    year_num = ym_dt.year
+    month_num = ym_dt.month
+    days_in_month = calendar.monthrange(year_num, month_num)[1]
+    month_prefix = f"{year_num:04d}-{month_num:02d}"
+
+    class_filter = request.args.get("class_name", "ALL")
+    room_code_filter = request.args.get("room_code", "ALL")
+
+    sql = """
+        SELECT s.id, s.full_name, s.class_name, r.code AS room_code, r.capacity AS room_capacity
+        FROM students s
+        JOIN rooms r ON s.room_id = r.id
+        WHERE 1=1
+    """
+    params = []
+    if class_filter != "ALL":
+        sql += " AND s.class_name = ?"
+        params.append(class_filter)
+    if room_code_filter != "ALL":
+        sql += " AND r.code = ?"
+        params.append(room_code_filter)
+    sql += " ORDER BY CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name"
+
+    students_rows = db.execute(sql, params).fetchall()
+
+    att_rows = db.execute("""
+        SELECT student_id, work_date, COALESCE(status, '') AS status, COALESCE(phone_status, '') AS phone_status
+        FROM attendance
+        WHERE work_date LIKE ?
+    """, (f"{month_prefix}-%",)).fetchall()
+
+    status_map = {}
+    latest_phone_map = {}
+    for ar in att_rows:
+        sid = ar["student_id"]
+        wdate = ar["work_date"]
+        status_map[(sid, wdate)] = ar["status"]
+        ps = normalize_phone_status(ar["phone_status"])
+        if ps:
+            prev = latest_phone_map.get(sid)
+            if not prev or wdate > prev[0]:
+                latest_phone_map[sid] = (wdate, ps)
+
+    day_cols = [f"{month_prefix}-{d:02d}" for d in range(1, days_in_month + 1)]
+    headers = (
+        ["#", "Ism-familiya", "Sinf", "Xona"]
+        + [str(d) for d in range(1, days_in_month + 1)]
+        + ["Bor (+)", "Yo'q (-)", "Telefon"]
+    )
+    col_widths = (
+        [5, 26, 10, 14]
+        + [4.5 for _ in range(days_in_month)]
+        + [10, 10, 20]
+    )
+    center_cols = [1, 3, 4] + list(range(5, 5 + days_in_month)) + [5 + days_in_month, 6 + days_in_month]
+
+    rows_data = []
+    total_plus_all = 0
+    total_minus_all = 0
+    for idx, st in enumerate(students_rows, start=1):
+        sid = st["id"]
+        day_cells = []
+        p_cnt = 0
+        m_cnt = 0
+        for d_iso in day_cols:
+            stt = status_map.get((sid, d_iso), "")
+            if stt == "+":
+                p_cnt += 1
+                day_cells.append("+")
+            elif stt == "-":
+                m_cnt += 1
+                day_cells.append("-")
+            else:
+                day_cells.append("")
+        total_plus_all += p_cnt
+        total_minus_all += m_cnt
+        phone_val = latest_phone_map[sid][1] if sid in latest_phone_map else "Belgilanmagan"
+        rows_data.append(
+            [idx, st["full_name"], st["class_name"], f"{st['room_code']} ({st['room_capacity']} k.)"]
+            + day_cells
+            + [p_cnt, m_cnt, phone_val]
+        )
+
+    title_line = f"Yotoqxona 1 Oylik Davomat Hisoboti — {format_uz_month(year_num, month_num)}"
+    summary_line = f"O'quvchilar: {len(students_rows)} | Kunlar: {days_in_month} | Jami Bor (+): {total_plus_all} | Jami Yo'q (-): {total_minus_all}"
+    xlsx_bytes = build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths, center_cols=center_cols)
+
+    fname = f"davomat_oylik_{month_prefix}.xlsx"
     return Response(
         xlsx_bytes,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
