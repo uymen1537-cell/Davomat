@@ -683,7 +683,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Telefon Nazorati — Berildi / Olingan / Berilmadi</h2>
-                  <p class="muted">Berildi yoki Olingan bosilganda kamera oynasi ochiladi. Jonli kamera ishlamasa ham "Kamera / Galereyadan rasmga olish" tugmasi darhol rasmni oladi va saqlaydi.</p>
+                  <p class="muted">Berildi yoki Olingan bosilganda kamera oynasi ochiladi. Brauzer ruxsat so'ramasa ham pastdagi tugma orqali rasmga olib darhol yuborishingiz mumkin.</p>
                 </div>
                 <form method="POST" action="{url_for('set_all_phones_not_given')}" onsubmit="return confirm('Ro\'yxatdagi barcha o\'quvchilarga \'Berilmadi\' belgilansinmi?');">
                   <input type="hidden" name="work_date" value="{esc(selected_date)}" />
@@ -709,7 +709,7 @@ def render_page(page_name):
                 <div id="camera-error" class="alert alert-error hidden"></div>
                 <div class="camera-actions">
                   <button type="button" id="btn-capture-live" class="btn btn-primary full-width" onclick="capturePhoto()">Jonli Kamerada Rasmga Olish</button>
-                  <button type="button" id="btn-open-file-cam" class="btn btn-soft full-width mt-12" onclick="triggerFileCamera()">Kamera / Galereyadan Rasmga Olish</button>
+                  <button type="button" id="btn-open-file-cam" class="btn btn-soft full-width mt-12" onclick="triggerFileCamera()">Kamera / Galereyadan Rasmga Olish va Saqlash</button>
                   <input type="file" id="camera-file-input" accept="image/*" capture="environment" class="hidden" onchange="handleFileCapture(this)" />
                 </div>
                 <form id="photo-submit-form" method="POST" action="{url_for('save_phone_photo')}" class="hidden">
@@ -1081,7 +1081,6 @@ def render_page(page_name):
     .camera-viewport video {{ width: 100%; max-height: 320px; border-radius: 12px; background: #000; }}
     .checkbox-inline {{ display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }}
 
-    /* Qulay telefon rejimi (data-device="phone" yoki kichik ekran) */
     html[data-device="phone"] .container {{ max-width: 520px; }}
     html[data-device="phone"] body {{ padding: 10px; }}
     html[data-device="phone"] .glass-card {{ padding: 13px; border-radius: 14px; }}
@@ -1259,7 +1258,7 @@ def render_page(page_name):
       if (!isSecure || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
         if (captureBtn) captureBtn.classList.add("hidden");
         if (errBox) {{
-          errBox.textContent = "Jonli kamera faqat HTTPS yoki localhost da ruxsat so'raydi. Pastdagi 'Kamera / Galereyadan Rasmga Olish' tugmasini bosing.";
+          errBox.textContent = "Brauzer jonli kamera ruxsatini ochmadi (HTTPS yoki localhost talab qilinadi). 'Kamera / Galereyadan Rasmga Olish va Saqlash' tugmasini bosing.";
           errBox.classList.remove("hidden");
         }}
         return;
@@ -1275,7 +1274,7 @@ def render_page(page_name):
       }} catch (err) {{
         if (captureBtn) captureBtn.classList.add("hidden");
         if (errBox) {{
-          errBox.textContent = "Kamera ochilmadi (" + (err.name || err.message || err) + "). Pastdagi 'Kamera / Galereyadan Rasmga Olish' tugmasini bosing.";
+          errBox.textContent = "Kamera ruxsati so'ralmadi yoki bloklangan (" + (err.name || err.message || err) + "). 'Kamera / Galereyadan Rasmga Olish va Saqlash' tugmasini bosing.";
           errBox.classList.remove("hidden");
         }}
       }}
