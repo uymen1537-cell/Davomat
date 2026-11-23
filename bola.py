@@ -627,7 +627,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Excel Davomat ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Har bir kunning davomati alohida saqlanadi. Yuqoridagi sana maydonidan istalgan kunni (masalan 21-sanani) ko'rishingiz mumkin.</p>
+                  <p class="muted">Har bir kunning davomati alohida saqlanadi. Yuqoridagi sana maydonidan istalgan kunni ko'rishingiz mumkin.</p>
                 </div>
                 <form method="GET" action="{url_for('attendance_page')}" class="filter-bar">
                   <input type="hidden" name="date" value="{esc(selected_date)}" />
@@ -665,7 +665,6 @@ def render_page(page_name):
                     p_badge = '<span class="badge badge-none">Belgilanmagan</span>'
 
                 p_img = f'<a href="{url_for("static", filename=st["phone_photo"])}" target="_blank" class="btn btn-soft btn-sm">Ko\'rish</a>' if st["phone_photo"] else "—"
-                safe_name = esc(st["full_name"]).replace("'", "")
 
                 p_rows += f"""
                 <tr>
@@ -674,8 +673,16 @@ def render_page(page_name):
                   <td data-label="Holat">{p_badge}</td>
                   <td data-label="Amallar">
                     <div class="phone-btn-group">
-                      <button type="button" class="btn btn-primary btn-sm" onclick="openLiveCamera({st['id']}, '{safe_name}', 'Berildi')">Berildi (Kamera)</button>
-                      <button type="button" class="btn btn-soft btn-sm" onclick="openLiveCamera({st['id']}, '{safe_name}', 'Olingan')">Olingan (Kamera)</button>
+                      <button type="button" class="btn btn-primary btn-sm"
+                        data-student-id="{st['id']}"
+                        data-student-name="{esc(st['full_name'])}"
+                        data-phone-status="Berildi"
+                        onclick="openCameraFromBtn(this)">Berildi (Kamera)</button>
+                      <button type="button" class="btn btn-soft btn-sm"
+                        data-student-id="{st['id']}"
+                        data-student-name="{esc(st['full_name'])}"
+                        data-phone-status="Olingan"
+                        onclick="openCameraFromBtn(this)">Olingan (Kamera)</button>
                       <form method="POST" action="{url_for('set_phone_status')}" class="inline-form">
                         <input type="hidden" name="student_id" value="{st['id']}" />
                         <input type="hidden" name="work_date" value="{esc(selected_date)}" />
@@ -692,7 +699,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Telefon Nazorati ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Vaqt Toshkent (UTC+5) bo'yicha yoziladi va tanlangan sana uchun saqlanadi.</p>
+                  <p class="muted">Yangi qo'shilgan o'quvchilarda ham kamera oynasi ochiladi. Vaqt Toshkent (UTC+5) bo'yicha yoziladi.</p>
                 </div>
                 <form method="POST" action="{url_for('set_all_phones_not_given')}" onsubmit="return confirm('Ro\'yxatdagi barcha o\'quvchilarga \'Berilmadi\' belgilansinmi?');">
                   <input type="hidden" name="work_date" value="{esc(selected_date)}" />
@@ -1255,6 +1262,14 @@ def render_page(page_name):
       else if (e.key === "+" || e.key === "=") {{ e.preventDefault(); setRowPlus(curRow); }}
       else if (e.key === "-") {{ e.preventDefault(); openRowMinus(curRow); }}
     }});
+
+    function openCameraFromBtn(btn) {{
+      if (!btn) return;
+      const sid = btn.dataset.studentId;
+      const sname = btn.dataset.studentName || "";
+      const pstatus = btn.dataset.phoneStatus || "Berildi";
+      openLiveCamera(sid, sname, pstatus);
+    }}
 
     function triggerFileCamera() {{
       const fileInput = document.getElementById("camera-file-input");
