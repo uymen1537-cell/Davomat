@@ -3,10 +3,11 @@ import time
 import html
 import sqlite3
 import base64
-from datetime import datetime, date, timezone, timedelta
+from urllib.parse import quote
+from datetime import datetime, timezone, timedelta
 from flask import (
     Flask, request, redirect, url_for, session, flash,
-    get_flashed_messages, g, jsonify
+    get_flashed_messages, g, jsonify, Response
 )
 
 app = Flask(__name__)
@@ -68,7 +69,8 @@ def now_uz():
 
 
 def esc(val):
-    return html.escape(str(val or ""), quote=True)
+    s = html.escape(str(val or ""), quote=True)
+    return s.replace('"', "&quot;")
 
 
 def get_client_ip():
@@ -214,6 +216,19 @@ def rewrite_talabalar_txt(db):
         f.write("# Ism Familiya | Sinf | Xona | Sig'im (6 yoki 4)\n")
         for r in rows:
             f.write(f"{r['full_name']} | {r['class_name']} | {r['code']} | {r['capacity']}\n")
+
+
+def normalize_phone_status(val):
+    v = (val or "").strip()
+    mapping = {
+        "Berildi": "Berildi",
+        "Biz bermadik": "Biz bermadik",
+        "Berilmadi": "Biz bermadik",
+        "O'quvchi oldi": "O'quvchi oldi",
+        "Olingan": "O'quvchi oldi",
+        "O'quvchi bermadi": "O'quvchi bermadi",
+    }
+    return mapping.get(v, "")
 
 
 def init_db():
@@ -384,6 +399,42 @@ def active_theme():
     return auto_theme_by_hour() if auto_enabled else "day"
 
 
+def fetch_students_with_attendance(db, work_date):
+    all_students_raw = db.execute("SELECT id FROM students").fetchall()
+    for s in all_students_raw:
+        db.execute("""
+            INSERT OR IGNORE INTO attendance (student_id, work_date, status, phone_status, phone_given)
+            VALUES (?, ?, '', '', 0)
+        """, (s["id"], work_date))
+    db.commit()
+
+    rows = db.execute("""
+        SELECT s.id, s.full_name, s.class_name, s.room_id,
+               r.code AS room_code, r.sub_label AS room_sub_label, r.capacity AS room_capacity,
+               COALESCE(a.status, '') AS status,
+               COALESCE(a.reason_type, '') AS reason_type,
+               COALESCE(a.reason_note, '') AS reason_note,
+               COALESCE(a.phone_status, '') AS phone_status,
+               COALESCE(a.phone_given, 0) AS phone_given,
+               COALESCE(a.phone_photo, '') AS phone_photo,
+               COALESCE(a.phone_time, '') AS phone_time
+        FROM students s
+        JOIN rooms r ON s.room_id = r.id
+        LEFT JOIN attendance a ON a.student_id = s.id AND a.work_date = ?
+        ORDER BY CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name
+    """, (work_date,)).fetchall()
+
+    students = []
+    for r in rows:
+        d = dict(r)
+        norm_ps = normalize_phone_status(d["phone_status"])
+        if not norm_ps and d["phone_given"] == 1:
+            norm_ps = "Berildi"
+        d["phone_status"] = norm_ps
+        students.append(d)
+    return students
+
+
 def render_page(page_name):
     ensure_day_rollover()
     db = get_db()
@@ -412,39 +463,13 @@ def render_page(page_name):
         d["on_duty"] = on_duty
         supervisors.append(d)
         if on_duty:
-            active_duty_list.append(f"{esc(d['teacher_name'])} ({esc(d['shift_start'])}-{esc(d['shift_end'])})")
+            t_name = esc(d["teacher_name"])
+            s_start = esc(d["shift_start"])
+            s_end = esc(d["shift_end"])
+            active_duty_list.append(f"{t_name} ({s_start}-{s_end})")
     duty_banner_text = ", ".join(active_duty_list) if active_duty_list else "Hozir smena vaqtidan tashqari"
 
-    all_students_raw = db.execute("SELECT id FROM students").fetchall()
-    for s in all_students_raw:
-        db.execute("""
-            INSERT OR IGNORE INTO attendance (student_id, work_date, status, phone_status, phone_given)
-            VALUES (?, ?, '', '', 0)
-        """, (s["id"], selected_date))
-    db.commit()
-
-    rows = db.execute("""
-        SELECT s.id, s.full_name, s.class_name, s.room_id,
-               r.code AS room_code, r.sub_label AS room_sub_label, r.capacity AS room_capacity,
-               COALESCE(a.status, '') AS status,
-               COALESCE(a.reason_type, '') AS reason_type,
-               COALESCE(a.reason_note, '') AS reason_note,
-               COALESCE(a.phone_status, '') AS phone_status,
-               COALESCE(a.phone_given, 0) AS phone_given,
-               COALESCE(a.phone_photo, '') AS phone_photo,
-               COALESCE(a.phone_time, '') AS phone_time
-        FROM students s
-        JOIN rooms r ON s.room_id = r.id
-        LEFT JOIN attendance a ON a.student_id = s.id AND a.work_date = ?
-        ORDER BY CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name
-    """, (selected_date,)).fetchall()
-
-    students = []
-    for r in rows:
-        d = dict(r)
-        if not d["phone_status"] and d["phone_given"] == 1:
-            d["phone_status"] = "Berildi"
-        students.append(d)
+    students = fetch_students_with_attendance(db, selected_date)
 
     classes = sorted(list({st["class_name"] for st in students}))
     room_codes = [f"{i}c" for i in range(1, 13)]
@@ -461,8 +486,9 @@ def render_page(page_name):
     unmarked_count = total_count - present_count - absent_count
 
     phone_given_count = sum(1 for st in students if st["phone_status"] == "Berildi")
-    phone_taken_count = sum(1 for st in students if st["phone_status"] == "Olingan")
-    phone_not_given_count = sum(1 for st in students if st["phone_status"] == "Berilmadi")
+    phone_not_given_by_us_count = sum(1 for st in students if st["phone_status"] == "Biz bermadik")
+    student_took_count = sum(1 for st in students if st["phone_status"] == "O'quvchi oldi")
+    student_not_given_count = sum(1 for st in students if st["phone_status"] == "O'quvchi bermadi")
 
     class_chips_html = "".join(
         f'<div class="chip"><strong>{esc(cname)}:</strong> {sum(1 for st in students if st["class_name"] == cname and st["status"] == "+")}</div>'
@@ -500,12 +526,13 @@ def render_page(page_name):
     role_badge_html = ""
     if role:
         r_label = {"ustoz": "Ustoz", "oshpaz": "Oshpaz", "superadmin": "Super Admin"}.get(role, role)
-        role_badge_html = f'''
+        logout_url = url_for("logout")
+        role_badge_html = f"""
           <span class="role-pill role-{esc(role)}">{esc(r_label)}</span>
-          <form method="POST" action="{url_for('logout')}" class="inline-form">
+          <form method="POST" action="{logout_url}" class="inline-form">
             <button type="submit" class="btn btn-outline btn-sm">Chiqish</button>
           </form>
-        '''
+        """
 
     theme_btn_label = "Kechki rejim" if theme == "day" else "Kunduzgi rejim"
     theme_next_val = "night" if theme == "day" else "day"
@@ -514,6 +541,7 @@ def render_page(page_name):
     device_next_val = "desktop" if device_mode == "phone" else "phone"
 
     if page_name == "login":
+        login_url = url_for("login")
         body_html = f"""
         <section class="login-wrapper">
           <div class="glass-card login-card">
@@ -524,7 +552,7 @@ def render_page(page_name):
                 <p class="muted">Rolni tanlang va PIN-kodni kiriting.</p>
               </div>
             </div>
-            <form method="POST" action="{url_for('login')}">
+            <form method="POST" action="{login_url}">
               <label class="field-label">Rolni tanlang</label>
               <div class="role-select-grid">
                 <label class="role-option">
@@ -548,6 +576,7 @@ def render_page(page_name):
         </section>
         """
     elif page_name == "chef":
+        chef_url = url_for("chef_page", date=selected_date)
         body_html = f"""
         <section class="chef-section glass-card">
           <div class="chef-date">{esc(format_uz_date(selected_date))}</div>
@@ -559,19 +588,22 @@ def render_page(page_name):
             <div>Belgilanmagan: <strong>{unmarked_count}</strong></div>
           </div>
           <div class="chip-row mb-16">{class_chips_html}</div>
-          <a href="{url_for('chef_page', date=selected_date)}" class="btn btn-primary">Yangilash</a>
+          <a href="{chef_url}" class="btn btn-primary">Yangilash</a>
         </section>
         """
     else:
+        super_url = url_for("superadmin_page", date=selected_date)
+        super_active = "active" if page_name == "superadmin" else ""
         super_tab = (
-            f'<a href="{url_for("superadmin_page", date=selected_date)}" class="nav-tab {"active" if page_name == "superadmin" else ""}">5. Super Admin</a>'
+            f'<a href="{super_url}" class="nav-tab {super_active}">5. Super Admin</a>'
             if role == "superadmin" else ""
         )
         endpoint_name = request.endpoint if request.endpoint in (
             "attendance_page", "phones_page", "students_page", "rooms_page", "superadmin_page"
         ) else "attendance_page"
+        today_url = url_for(endpoint_name, date=today_str())
         today_btn = (
-            f'<a href="{url_for(endpoint_name, date=today_str())}" class="btn btn-primary btn-sm">Bugun</a>'
+            f'<a href="{today_url}" class="btn btn-primary btn-sm">Bugun</a>'
             if selected_date != today_str() else ""
         )
 
@@ -585,109 +617,153 @@ def render_page(page_name):
                 f'<option value="{esc(rc)}" {"selected" if room_code_filter == rc else ""}>{esc(rc)}</option>'
                 for rc in room_codes
             )
+            export_url = url_for(
+                "export_attendance_excel",
+                date=selected_date,
+                class_name=class_filter,
+                room_code=room_code_filter,
+            )
+            att_form_url = url_for("attendance_page")
             rows_html = ""
             for idx, st in enumerate(filtered_students, start=1):
+                sid = st["id"]
                 active_cls = "active-row" if idx == 1 else ""
                 p_cls = "is-plus" if st["status"] == "+" else ""
                 m_cls = "is-minus" if st["status"] == "-" else ""
-                tag_txt = "Bor" if st["status"] == "+" else ("Yo'q" if st["status"] == "-" else "—")
+                tag_txt = "Bor (+)" if st["status"] == "+" else ("Yo'q (-)" if st["status"] == "-" else "Belgilanmagan")
                 r_disp = ""
                 if st["status"] == "-":
                     r_disp = f'{esc(st["reason_type"])}: {esc(st["reason_note"])}' if st["reason_note"] else esc(st["reason_type"])
                 note_hidden = "" if st["reason_type"] == "Boshqa sabab" else "hidden"
+                sel_1 = "selected" if st["reason_type"] == "Sababli" else ""
+                sel_2 = "selected" if st["reason_type"] == "O'zboshimchalik bilan" else ""
+                sel_3 = "selected" if st["reason_type"] == "Boshqa sabab" else ""
                 rows_html += f"""
-                <tr class="excel-row {active_cls}" tabindex="0" data-student-id="{st['id']}" data-status="{esc(st['status'])}" onclick="focusRow(this)">
+                <tr class="excel-row {active_cls}" tabindex="0"
+                    data-student-id="{sid}"
+                    data-student-name="{esc(st["full_name"])}"
+                    data-status="{esc(st["status"])}"
+                    onclick="focusRow(this)">
                   <td data-label="#">{idx}</td>
-                  <td data-label="O'quvchi"><strong>{esc(st['full_name'])}</strong></td>
-                  <td data-label="Sinf">{esc(st['class_name'])}</td>
-                  <td data-label="Xona">{esc(st['room_code'])} <small>({st['room_capacity']} k.)</small></td>
-                  <td data-label="+ / -">
+                  <td data-label="O'quvchi"><strong>{esc(st["full_name"])}</strong></td>
+                  <td data-label="Sinf">{esc(st["class_name"])}</td>
+                  <td data-label="Xona">{esc(st["room_code"])} <small>({st["room_capacity"]} k.)</small></td>
+                  <td data-label="Davomat">
                     <div class="att-actions">
                       <button type="button" class="cell-btn plus-btn {p_cls}" onclick="event.stopPropagation(); setRowPlus(this.closest('tr'))">+</button>
                       <button type="button" class="cell-btn minus-btn {m_cls}" onclick="event.stopPropagation(); openRowMinus(this.closest('tr'))">-</button>
-                      <span class="status-tag" id="tag-{st['id']}">{tag_txt}</span>
+                      <span class="status-tag" id="tag-{sid}">{tag_txt}</span>
                     </div>
                   </td>
                   <td data-label="Sabab">
-                    <div id="reason-display-{st['id']}" class="reason-display">{r_disp}</div>
-                    <div class="inline-reason-editor hidden" id="editor-{st['id']}" onclick="event.stopPropagation()">
-                      <select class="input input-sm" id="rtype-{st['id']}" onchange="checkOtherInput({st['id']})">
-                        <option value="Sababli" {"selected" if st["reason_type"] == "Sababli" else ""}>Sababli</option>
-                        <option value="O'zboshimchalik bilan" {"selected" if st["reason_type"] == "O'zboshimchalik bilan" else ""}>O'zboshimchalik bilan</option>
-                        <option value="Boshqa sabab" {"selected" if st["reason_type"] == "Boshqa sabab" else ""}>Boshqa sabab</option>
+                    <div id="reason-display-{sid}" class="reason-display">{r_disp}</div>
+                    <div class="inline-reason-editor hidden" id="editor-{sid}" onclick="event.stopPropagation()">
+                      <select class="input input-sm" id="rtype-{sid}" onchange="checkOtherInput({sid})">
+                        <option value="Sababli" {sel_1}>Sababli</option>
+                        <option value="O'zboshimchalik bilan" {sel_2}>O'zboshimchalik bilan</option>
+                        <option value="Boshqa sabab" {sel_3}>Boshqa sabab</option>
                       </select>
-                      <input type="text" class="input input-sm {note_hidden}" id="rnote-{st['id']}" value="{esc(st['reason_note'])}" placeholder="Izoh..." />
-                      <button type="button" class="btn btn-danger btn-sm" onclick="saveRowMinus({st['id']}, this.closest('tr'))">Saqlash &rarr;</button>
+                      <input type="text" class="input input-sm {note_hidden}" id="rnote-{sid}" value="{esc(st["reason_note"])}" placeholder="Izoh..." />
+                      <button type="button" class="btn btn-danger btn-sm" onclick="saveRowMinus({sid}, this.closest('tr'))">Saqlash &rarr;</button>
                     </div>
                   </td>
                 </tr>
                 """
+            all_cls_sel = "selected" if class_filter == "ALL" else ""
+            all_rm_sel = "selected" if room_code_filter == "ALL" else ""
             sub_content = f"""
             <section class="glass-card section-box">
               <div class="section-header">
                 <div>
-                  <h2>Excel Davomat ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Har bir kunning davomati alohida saqlanadi. Yuqoridagi sana maydonidan istalgan kunni ko'rishingiz mumkin.</p>
+                  <h2>Katta Excel Davomat Jadvali ({esc(format_uz_date(selected_date))})</h2>
+                  <p class="muted">Katakchalarda + / - belgilang, pastda "Hammasini saqlash" tugmasini bosing yoki istalgan payt Excel yuklab oling.</p>
                 </div>
-                <form method="GET" action="{url_for('attendance_page')}" class="filter-bar">
-                  <input type="hidden" name="date" value="{esc(selected_date)}" />
-                  <select name="class_name" class="input input-sm" onchange="this.form.submit()">
-                    <option value="ALL" {"selected" if class_filter == "ALL" else ""}>Barcha sinflar</option>
-                    {class_opts}
-                  </select>
-                  <select name="room_code" class="input input-sm" onchange="this.form.submit()">
-                    <option value="ALL" {"selected" if room_code_filter == "ALL" else ""}>1c-12c barchasi</option>
-                    {room_opts}
-                  </select>
-                </form>
+                <div class="filter-bar">
+                  <form method="GET" action="{att_form_url}" class="filter-bar">
+                    <input type="hidden" name="date" value="{esc(selected_date)}" />
+                    <select name="class_name" class="input input-sm" onchange="this.form.submit()">
+                      <option value="ALL" {all_cls_sel}>Barcha sinflar</option>
+                      {class_opts}
+                    </select>
+                    <select name="room_code" class="input input-sm" onchange="this.form.submit()">
+                      <option value="ALL" {all_rm_sel}>1c-12c barchasi</option>
+                      {room_opts}
+                    </select>
+                  </form>
+                  <a href="{export_url}" class="btn btn-soft btn-sm">Excel yuklab olish</a>
+                </div>
               </div>
+
+              <div id="att-save-feedback" class="alert hidden"></div>
+
               <div class="table-wrap">
-                <table class="excel-table responsive-table" id="excel-attendance-table">
+                <table class="excel-table excel-grid-table responsive-table" id="excel-attendance-table">
                   <thead>
-                    <tr><th>#</th><th>O'quvchi</th><th>Sinf</th><th>Xona</th><th>+ / -</th><th>Sabab</th></tr>
+                    <tr><th>#</th><th>O'quvchi</th><th>Sinf</th><th>Xona</th><th>Davomat (+ / -)</th><th>Sabab</th></tr>
                   </thead>
                   <tbody>{rows_html}</tbody>
                 </table>
               </div>
+
+              <div class="bulk-save-bar">
+                <span id="att-unmarked-summary" class="muted">Holatni belgilab, saqlang.</span>
+                <div class="bulk-save-actions">
+                  <a href="{export_url}" class="btn btn-outline">Excel yuklab olish</a>
+                  <button type="button" id="btn-save-all-attendance" class="btn btn-primary" onclick="saveAllAttendance()">Hammasini saqlash</button>
+                </div>
+              </div>
             </section>
             """
         elif page_name == "phones":
+            set_status_url = url_for("set_phone_status")
+            set_all_url = url_for("set_all_phones_not_given")
+            save_photo_url = url_for("save_phone_photo")
             p_rows = ""
             for st in students:
                 ps = st["phone_status"]
+                pt = esc(st["phone_time"])
                 if ps == "Berildi":
-                    p_badge = f'<span class="badge badge-phone">Berildi ({esc(st["phone_time"])})</span>'
-                elif ps == "Olingan":
-                    p_badge = f'<span class="badge badge-taken">Olingan ({esc(st["phone_time"])})</span>'
-                elif ps == "Berilmadi":
-                    p_badge = f'<span class="badge badge-notgiven">Berilmadi ({esc(st["phone_time"])})</span>'
+                    p_badge = f'<span class="badge badge-phone">Berildi ({pt})</span>'
+                elif ps == "Biz bermadik":
+                    p_badge = f'<span class="badge badge-notgiven">Biz bermadik ({pt})</span>'
+                elif ps == "O'quvchi oldi":
+                    p_badge = f'<span class="badge badge-taken">O\'quvchi oldi ({pt})</span>'
+                elif ps == "O'quvchi bermadi":
+                    p_badge = f'<span class="badge badge-notgiven">O\'quvchi bermadi ({pt})</span>'
                 else:
                     p_badge = '<span class="badge badge-none">Belgilanmagan</span>'
 
-                p_img = f'<a href="{url_for("static", filename=st["phone_photo"])}" target="_blank" class="btn btn-soft btn-sm">Ko\'rish</a>' if st["phone_photo"] else "—"
+                photo_href = url_for("static", filename=st["phone_photo"]) if st["phone_photo"] else ""
+                p_img = f'<a href="{photo_href}" target="_blank" class="btn btn-soft btn-sm">Ko\'rish</a>' if st["phone_photo"] else "—"
 
                 p_rows += f"""
                 <tr>
-                  <td data-label="O'quvchi"><strong>{esc(st['full_name'])}</strong></td>
-                  <td data-label="Sinf / Xona">{esc(st['class_name'])} &middot; {esc(st['room_code'])}</td>
+                  <td data-label="O'quvchi"><strong>{esc(st["full_name"])}</strong></td>
+                  <td data-label="Sinf / Xona">{esc(st["class_name"])} &middot; {esc(st["room_code"])}</td>
                   <td data-label="Holat">{p_badge}</td>
                   <td data-label="Amallar">
                     <div class="phone-btn-group">
                       <button type="button" class="btn btn-primary btn-sm"
-                        data-student-id="{st['id']}"
-                        data-student-name="{esc(st['full_name'])}"
+                        data-student-id="{st["id"]}"
+                        data-student-name="{esc(st["full_name"])}"
                         data-phone-status="Berildi"
                         onclick="openCameraFromBtn(this)">Berildi (Kamera)</button>
-                      <button type="button" class="btn btn-soft btn-sm"
-                        data-student-id="{st['id']}"
-                        data-student-name="{esc(st['full_name'])}"
-                        data-phone-status="Olingan"
-                        onclick="openCameraFromBtn(this)">Olingan (Kamera)</button>
-                      <form method="POST" action="{url_for('set_phone_status')}" class="inline-form">
-                        <input type="hidden" name="student_id" value="{st['id']}" />
+                      <form method="POST" action="{set_status_url}" class="inline-form">
+                        <input type="hidden" name="student_id" value="{st["id"]}" />
                         <input type="hidden" name="work_date" value="{esc(selected_date)}" />
-                        <input type="hidden" name="phone_status" value="Berilmadi" />
-                        <button type="submit" class="btn btn-outline btn-sm">Berilmadi</button>
+                        <input type="hidden" name="phone_status" value="Biz bermadik" />
+                        <button type="submit" class="btn btn-outline btn-sm">Biz bermadik</button>
+                      </form>
+                      <button type="button" class="btn btn-soft btn-sm"
+                        data-student-id="{st["id"]}"
+                        data-student-name="{esc(st["full_name"])}"
+                        data-phone-status="O'quvchi oldi"
+                        onclick="openCameraFromBtn(this)">O'quvchi oldi (Kamera)</button>
+                      <form method="POST" action="{set_status_url}" class="inline-form">
+                        <input type="hidden" name="student_id" value="{st["id"]}" />
+                        <input type="hidden" name="work_date" value="{esc(selected_date)}" />
+                        <input type="hidden" name="phone_status" value="O'quvchi bermadi" />
+                        <button type="submit" class="btn btn-outline btn-sm">O'quvchi bermadi</button>
                       </form>
                     </div>
                   </td>
@@ -699,18 +775,19 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Telefon Nazorati ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Yangi qo'shilgan o'quvchilarda ham kamera oynasi ochiladi. Vaqt Toshkent (UTC+5) bo'yicha yoziladi.</p>
+                  <p class="muted">Berildi / Biz bermadik — biz tomonimizdan; O'quvchi oldi / O'quvchi bermadi — o'quvchi tomonidan. Vaqt Toshkent (UTC+5) bo'yicha yoziladi.</p>
                 </div>
-                <form method="POST" action="{url_for('set_all_phones_not_given')}" onsubmit="return confirm('Ro\'yxatdagi barcha o\'quvchilarga \'Berilmadi\' belgilansinmi?');">
+                <form method="POST" action="{set_all_url}" onsubmit="return confirm('Ro\'yxatdagi barcha o\'quvchilarga \'Biz bermadik\' belgilansinmi?');">
                   <input type="hidden" name="work_date" value="{esc(selected_date)}" />
-                  <button type="submit" class="btn btn-danger">Berilmadi (Hammaga)</button>
+                  <button type="submit" class="btn btn-danger">Biz bermadik (Hammaga)</button>
                 </form>
               </div>
 
               <div class="phone-counters mb-16">
                 <span class="chip">Berildi: <strong>{phone_given_count}</strong></span>
-                <span class="chip">Olingan: <strong>{phone_taken_count}</strong></span>
-                <span class="chip">Berilmadi: <strong>{phone_not_given_count}</strong></span>
+                <span class="chip">Biz bermadik: <strong>{phone_not_given_by_us_count}</strong></span>
+                <span class="chip">O'quvchi oldi: <strong>{student_took_count}</strong></span>
+                <span class="chip">O'quvchi bermadi: <strong>{student_not_given_count}</strong></span>
               </div>
 
               <div id="camera-modal" class="camera-panel hidden">
@@ -728,7 +805,7 @@ def render_page(page_name):
                   <button type="button" id="btn-open-file-cam" class="btn btn-soft full-width mt-12" onclick="triggerFileCamera()">Kamera / Galereyadan Rasmga Olish va Saqlash</button>
                   <input type="file" id="camera-file-input" accept="image/*" capture="environment" class="hidden" onchange="handleFileCapture(this)" />
                 </div>
-                <form id="photo-submit-form" method="POST" action="{url_for('save_phone_photo')}" class="hidden">
+                <form id="photo-submit-form" method="POST" action="{save_photo_url}" class="hidden">
                   <input type="hidden" name="student_id" id="photo-student-id" />
                   <input type="hidden" name="phone_status" id="photo-phone-status" value="Berildi" />
                   <input type="hidden" name="work_date" value="{esc(selected_date)}" />
@@ -745,19 +822,25 @@ def render_page(page_name):
             </section>
             """
         elif page_name == "students":
+            add_st_url = url_for("add_student")
             room_select_opts = ""
             for rg in rooms_grouped:
                 dis = "disabled" if rg["occupied_count"] >= rg["capacity"] else ""
-                room_select_opts += f'<option value="{rg["id"]}" {dis}>{esc(rg["code"])} — {esc(rg["sub_label"])} ({rg["occupied_count"]}/{rg["capacity"]})</option>'
+                r_code = esc(rg["code"])
+                r_sub = esc(rg["sub_label"])
+                r_occ = rg["occupied_count"]
+                r_cap = rg["capacity"]
+                room_select_opts += f'<option value="{rg["id"]}" {dis}>{r_code} — {r_sub} ({r_occ}/{r_cap})</option>'
             st_rows = ""
             for st in students:
+                del_url = url_for("delete_student", student_id=st["id"])
                 st_rows += f"""
                 <tr>
-                  <td data-label="Ism-familiya">{esc(st['full_name'])}</td>
-                  <td data-label="Sinf">{esc(st['class_name'])}</td>
-                  <td data-label="Xona">{esc(st['room_code'])} ({esc(st['room_sub_label'])})</td>
+                  <td data-label="Ism-familiya">{esc(st["full_name"])}</td>
+                  <td data-label="Sinf">{esc(st["class_name"])}</td>
+                  <td data-label="Xona">{esc(st["room_code"])} ({esc(st["room_sub_label"])})</td>
                   <td data-label="Amal">
-                    <form method="POST" action="{url_for('delete_student', student_id=st['id'])}" onsubmit="return confirm('O\'chirilsinmi?');">
+                    <form method="POST" action="{del_url}" onsubmit="return confirm('O\'chirilsinmi?');">
                       <input type="hidden" name="work_date" value="{esc(selected_date)}" />
                       <button type="submit" class="btn btn-danger btn-sm">O'chirish</button>
                     </form>
@@ -767,7 +850,7 @@ def render_page(page_name):
             sub_content = f"""
             <section class="glass-card section-box">
               <h2>O'quvchi Qo'shish va Ro'yxat</h2>
-              <form method="POST" action="{url_for('add_student')}" class="form-grid mb-16">
+              <form method="POST" action="{add_st_url}" class="form-grid mb-16">
                 <input type="hidden" name="work_date" value="{esc(selected_date)}" />
                 <div>
                   <label class="field-label">Ism-familiya</label>
@@ -797,20 +880,21 @@ def render_page(page_name):
             r_cards = ""
             for rg in rooms_grouped:
                 if rg["occupants"]:
-                    lis = "".join(
-                        f'<li><span>{esc(o["full_name"])} <small>({esc(o["class_name"])})</small></span><span class="mini-badge {"plus" if o["status"]=="+" else ("minus" if o["status"]=="-" else "wait")}">{esc(o["status"]) or "?"}</span></li>'
-                        for o in rg["occupants"]
-                    )
+                    lis = ""
+                    for o in rg["occupants"]:
+                        m_cls = "plus" if o["status"] == "+" else ("minus" if o["status"] == "-" else "wait")
+                        m_txt = esc(o["status"]) or "?"
+                        lis += f'<li><span>{esc(o["full_name"])} <small>({esc(o["class_name"])})</small></span><span class="mini-badge {m_cls}">{m_txt}</span></li>'
                     occ_html = f'<ul class="occupant-list">{lis}</ul>'
                 else:
                     occ_html = '<p class="empty-room">Bo\'sh xona</p>'
                 r_cards += f"""
                 <div class="room-card">
                   <div class="room-card-top">
-                    <span class="room-code-badge">{esc(rg['code'])}</span>
-                    <span class="room-cap">{esc(rg['sub_label'])} &middot; <strong>{rg['occupied_count']}/{rg['capacity']}</strong></span>
+                    <span class="room-code-badge">{esc(rg["code"])}</span>
+                    <span class="room-cap">{esc(rg["sub_label"])} &middot; <strong>{rg["occupied_count"]}/{rg["capacity"]}</strong></span>
                   </div>
-                  <div class="room-present-note">Bor (+): <strong>{rg['present_in_room']}</strong></div>
+                  <div class="room-present-note">Bor (+): <strong>{rg["present_in_room"]}</strong></div>
                   {occ_html}
                 </div>
                 """
@@ -822,6 +906,9 @@ def render_page(page_name):
             """
         elif page_name == "superadmin" and role == "superadmin":
             chk = "checked" if auto_theme_enabled else ""
+            upd_sup_url = url_for("superadmin_update_supervisor")
+            tog_ontime_url = url_for("superadmin_toggle_ontime")
+            tog_theme_url = url_for("superadmin_toggle_auto_theme")
             sup_cards_html = ""
             for sp in supervisors:
                 duty_pill = '<span class="badge badge-phone">Hozir navbatchi</span>' if sp["on_duty"] else '<span class="badge badge-none">Navbatda emas</span>'
@@ -831,29 +918,29 @@ def render_page(page_name):
                 sup_cards_html += f"""
                 <div class="room-card">
                   <div class="room-card-top">
-                    <span class="room-code-badge">{sp['slot_number']}-Navbat</span>
+                    <span class="room-code-badge">{sp["slot_number"]}-Navbat</span>
                     {duty_pill}
                   </div>
                   <div class="mt-12">{ontime_pill}</div>
-                  <form method="POST" action="{url_for('superadmin_update_supervisor')}" class="mt-12">
-                    <input type="hidden" name="slot_number" value="{sp['slot_number']}" />
+                  <form method="POST" action="{upd_sup_url}" class="mt-12">
+                    <input type="hidden" name="slot_number" value="{sp["slot_number"]}" />
                     <input type="hidden" name="work_date" value="{esc(selected_date)}" />
                     <label class="field-label">Ustoz ismi</label>
-                    <input type="text" name="teacher_name" class="input input-sm" value="{esc(sp['teacher_name'])}" required />
+                    <input type="text" name="teacher_name" class="input input-sm" value="{esc(sp["teacher_name"])}" required />
                     <div class="form-grid mt-12">
                       <div>
                         <label class="field-label">Smena boshlanishi</label>
-                        <input type="text" name="shift_start" class="input input-sm" value="{esc(sp['shift_start'])}" required />
+                        <input type="text" name="shift_start" class="input input-sm" value="{esc(sp["shift_start"])}" required />
                       </div>
                       <div>
                         <label class="field-label">Smena tugashi</label>
-                        <input type="text" name="shift_end" class="input input-sm" value="{esc(sp['shift_end'])}" required />
+                        <input type="text" name="shift_end" class="input input-sm" value="{esc(sp["shift_end"])}" required />
                       </div>
                     </div>
                     <button type="submit" class="btn btn-primary btn-sm full-width mt-12">Saqlash</button>
                   </form>
-                  <form method="POST" action="{url_for('superadmin_toggle_ontime')}" class="mt-12">
-                    <input type="hidden" name="slot_number" value="{sp['slot_number']}" />
+                  <form method="POST" action="{tog_ontime_url}" class="mt-12">
+                    <input type="hidden" name="slot_number" value="{sp["slot_number"]}" />
                     <input type="hidden" name="work_date" value="{esc(selected_date)}" />
                     <input type="hidden" name="on_time" value="{sub_val}" />
                     <button type="submit" class="btn btn-soft btn-sm full-width">{sub_lbl}</button>
@@ -867,7 +954,7 @@ def render_page(page_name):
                 <span class="chip">Davomat yozuvlari: <strong>{total_attendance_records}</strong></span>
                 <span class="chip">Kamera rasmlari: <strong>{total_photos}</strong></span>
               </div>
-              <form method="POST" action="{url_for('superadmin_toggle_auto_theme')}" class="mb-16">
+              <form method="POST" action="{tog_theme_url}" class="mb-16">
                 <input type="hidden" name="work_date" value="{esc(selected_date)}" />
                 <label class="checkbox-inline">
                   <input type="checkbox" name="auto_theme" value="1" {chk} onchange="this.form.submit()" />
@@ -877,6 +964,21 @@ def render_page(page_name):
               <div class="rooms-grid">{sup_cards_html}</div>
             </section>
             """
+
+        date_form_url = url_for(endpoint_name)
+        set_theme_url = url_for("set_theme")
+        set_device_url = url_for("set_device")
+        att_nav_url = url_for("attendance_page", date=selected_date)
+        phones_nav_url = url_for("phones_page", date=selected_date)
+        students_nav_url = url_for("students_page", date=selected_date)
+        rooms_nav_url = url_for("rooms_page", date=selected_date)
+        chef_nav_url = url_for("chef_page", date=selected_date)
+
+        att_act = "active" if page_name == "attendance" else ""
+        ph_act = "active" if page_name == "phones" else ""
+        st_act = "active" if page_name == "students" else ""
+        rm_act = "active" if page_name == "rooms" else ""
+        ch_act = "active" if page_name == "chef" else ""
 
         body_html = f"""
         <header class="topbar glass-card">
@@ -890,16 +992,16 @@ def render_page(page_name):
             </div>
           </div>
           <div class="top-actions">
-            <form method="GET" action="{url_for(endpoint_name)}" class="inline-form date-form">
+            <form method="GET" action="{date_form_url}" class="inline-form date-form">
               <input type="date" name="date" value="{esc(selected_date)}" class="input input-sm" onchange="this.form.submit()" />
             </form>
             {today_btn}
-            <form method="POST" action="{url_for('set_theme')}" class="inline-form">
+            <form method="POST" action="{set_theme_url}" class="inline-form">
               <input type="hidden" name="theme" value="{theme_next_val}" />
               <input type="hidden" name="next_url" value="{esc(request.full_path)}" />
               <button type="submit" class="btn btn-outline btn-sm">{theme_btn_label}</button>
             </form>
-            <form method="POST" action="{url_for('set_device')}" class="inline-form">
+            <form method="POST" action="{set_device_url}" class="inline-form">
               <input type="hidden" name="device_mode" value="{device_next_val}" />
               <input type="hidden" name="next_url" value="{esc(request.full_path)}" />
               <button type="submit" class="btn btn-outline btn-sm">{device_btn_label}</button>
@@ -909,11 +1011,11 @@ def render_page(page_name):
         </header>
 
         <nav class="nav-tabs glass-card">
-          <a href="{url_for('attendance_page', date=selected_date)}" class="nav-tab {'active' if page_name == 'attendance' else ''}">1. Davomat</a>
-          <a href="{url_for('phones_page', date=selected_date)}" class="nav-tab {'active' if page_name == 'phones' else ''}">2. Telefon</a>
-          <a href="{url_for('students_page', date=selected_date)}" class="nav-tab {'active' if page_name == 'students' else ''}">3. O'quvchilar</a>
-          <a href="{url_for('rooms_page', date=selected_date)}" class="nav-tab {'active' if page_name == 'rooms' else ''}">4. Xonalar</a>
-          <a href="{url_for('chef_page', date=selected_date)}" class="nav-tab {'active' if page_name == 'chef' else ''}">Oshpaz</a>
+          <a href="{att_nav_url}" class="nav-tab {att_act}">1. Davomat</a>
+          <a href="{phones_nav_url}" class="nav-tab {ph_act}">2. Telefon</a>
+          <a href="{students_nav_url}" class="nav-tab {st_act}">3. O'quvchilar</a>
+          <a href="{rooms_nav_url}" class="nav-tab {rm_act}">4. Xonalar</a>
+          <a href="{chef_nav_url}" class="nav-tab {ch_act}">Oshpaz</a>
           {super_tab}
         </nav>
 
@@ -927,6 +1029,8 @@ def render_page(page_name):
         {sub_content}
         """
 
+    bulk_api_url = url_for("api_attendance_bulk")
+
     return f"""<!DOCTYPE html>
 <html lang="uz" data-theme="{esc(theme)}" data-device="{esc(device_mode)}">
 <head>
@@ -937,21 +1041,29 @@ def render_page(page_name):
   <style>
     :root {{
       --bg: #eef2f7;
-      --card: rgba(255, 255, 255, 0.9);
+      --card: rgba(255, 255, 255, 0.92);
+      --input-bg: #ffffff;
       --text: #0f172a;
       --muted: #64748b;
-      --border: rgba(15, 23, 42, 0.12);
+      --border: rgba(15, 23, 42, 0.14);
+      --grid-border: rgba(15, 23, 42, 0.18);
       --primary: #2563eb;
       --danger: #dc2626;
       --ok: #16a34a;
       --warn: #d97706;
     }}
+    html[data-theme="day"] {{
+      color-scheme: light;
+    }}
     html[data-theme="night"] {{
+      color-scheme: dark;
       --bg: #0b1120;
-      --card: rgba(15, 23, 42, 0.9);
+      --card: rgba(15, 23, 42, 0.92);
+      --input-bg: #111827;
       --text: #f8fafc;
       --muted: #94a3b8;
-      --border: rgba(148, 163, 184, 0.2);
+      --border: rgba(148, 163, 184, 0.24);
+      --grid-border: rgba(148, 163, 184, 0.28);
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -1019,7 +1131,7 @@ def render_page(page_name):
       gap: 12px;
       margin-bottom: 12px;
     }}
-    .filter-bar {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .filter-bar {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
     .table-wrap {{ overflow-x: auto; }}
     .excel-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
     .excel-table th, .excel-table td {{
@@ -1028,11 +1140,23 @@ def render_page(page_name):
       text-align: left;
       vertical-align: middle;
     }}
-    .excel-row.active-row {{ outline: 2px solid var(--primary); background: rgba(37, 99, 235, 0.06); }}
+    .excel-grid-table {{
+      border: 1px solid var(--grid-border);
+    }}
+    .excel-grid-table th {{
+      background: rgba(37, 99, 235, 0.08);
+      border: 1px solid var(--grid-border);
+      font-weight: 700;
+    }}
+    .excel-grid-table td {{
+      border: 1px solid var(--grid-border);
+    }}
+    .excel-row.active-row {{ outline: 2px solid var(--primary); background: rgba(37, 99, 235, 0.07); }}
+    .excel-row.needs-attention {{ outline: 2px solid var(--danger); background: rgba(220, 38, 38, 0.10); }}
     .att-actions {{ display: flex; align-items: center; gap: 6px; }}
     .cell-btn {{
       width: 34px; height: 34px; border-radius: 9px; border: 1px solid var(--border);
-      background: transparent; color: var(--text); font-weight: 700; cursor: pointer;
+      background: var(--input-bg); color: var(--text); font-weight: 700; cursor: pointer;
     }}
     .cell-btn.is-plus {{ background: var(--ok); color: #fff; border-color: var(--ok); }}
     .cell-btn.is-minus {{ background: var(--danger); color: #fff; border-color: var(--danger); }}
@@ -1041,24 +1165,41 @@ def render_page(page_name):
     .hidden {{ display: none !important; }}
     .input {{
       padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border);
-      background: transparent; color: var(--text); font-size: 14px;
+      background: var(--input-bg); color: var(--text); font-size: 14px;
+    }}
+    select.input, select.input option, select.input optgroup {{
+      background-color: var(--input-bg);
+      color: var(--text);
+    }}
+    html[data-theme="night"] select.input,
+    html[data-theme="night"] select.input option,
+    html[data-theme="night"] select.input optgroup {{
+      background-color: #111827;
+      color: #f8fafc;
+    }}
+    html[data-theme="day"] select.input,
+    html[data-theme="day"] select.input option,
+    html[data-theme="day"] select.input optgroup {{
+      background-color: #ffffff;
+      color: #0f172a;
     }}
     .input-sm {{ padding: 6px 8px; font-size: 13px; }}
     .btn {{
       padding: 9px 14px; border-radius: 10px; border: 1px solid transparent;
       font-weight: 600; font-size: 14px; cursor: pointer; text-decoration: none; display: inline-flex;
-      align-items: center; justify-content: center;
+      align-items: center; justify-content: center; gap: 6px;
     }}
     .btn-sm {{ padding: 6px 11px; font-size: 12px; }}
     .btn-primary {{ background: var(--primary); color: #fff; }}
     .btn-danger {{ background: var(--danger); color: #fff; }}
-    .btn-soft {{ background: rgba(37, 99, 235, 0.12); color: var(--primary); }}
-    .btn-outline {{ border-color: var(--border); background: transparent; color: var(--text); }}
+    .btn-soft {{ background: rgba(37, 99, 235, 0.14); color: var(--primary); }}
+    html[data-theme="night"] .btn-soft {{ color: #93c5fd; background: rgba(59, 130, 246, 0.2); }}
+    .btn-outline {{ border-color: var(--border); background: var(--input-bg); color: var(--text); }}
     .full-width {{ width: 100%; }}
     .mt-12 {{ margin-top: 12px; }}
     .mb-16 {{ margin-bottom: 16px; }}
     .chip-row, .phone-counters, .phone-btn-group {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-    .chip {{ padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); font-size: 13px; }}
+    .chip {{ padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); font-size: 13px; background: var(--input-bg); }}
     .badge {{ padding: 4px 8px; border-radius: 8px; font-size: 12px; font-weight: 600; }}
     .badge-phone {{ background: rgba(22, 163, 74, 0.15); color: var(--ok); }}
     .badge-taken {{ background: rgba(37, 99, 235, 0.15); color: var(--primary); }}
@@ -1067,8 +1208,19 @@ def render_page(page_name):
     .badge-none {{ background: rgba(148, 163, 184, 0.18); color: var(--muted); }}
     .role-pill {{ padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; background: rgba(37, 99, 235, 0.15); }}
     .alert {{ padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; font-weight: 600; }}
-    .alert-error {{ background: rgba(220, 38, 38, 0.15); color: var(--danger); }}
-    .alert-success {{ background: rgba(22, 163, 74, 0.15); color: var(--ok); }}
+    .alert-error {{ background: rgba(220, 38, 38, 0.15); color: var(--danger); border: 1px solid rgba(220, 38, 38, 0.35); }}
+    .alert-success {{ background: rgba(22, 163, 74, 0.15); color: var(--ok); border: 1px solid rgba(22, 163, 74, 0.35); }}
+    .bulk-save-bar {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }}
+    .bulk-save-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
     .login-wrapper {{ display: flex; justify-content: center; padding: 32px 0; }}
     .login-card {{ width: 100%; max-width: 420px; }}
     .login-brand {{ display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }}
@@ -1077,7 +1229,7 @@ def render_page(page_name):
     .role-select-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }}
     .role-option {{
       border: 1px solid var(--border); border-radius: 10px; padding: 8px;
-      display: flex; gap: 6px; align-items: flex-start; cursor: pointer;
+      display: flex; gap: 6px; align-items: flex-start; cursor: pointer; background: var(--input-bg);
     }}
     .role-option span {{ display: flex; flex-direction: column; font-size: 12px; }}
     .chef-section {{ text-align: center; max-width: 680px; margin: 20px auto; }}
@@ -1087,60 +1239,78 @@ def render_page(page_name):
     .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }}
     .align-end {{ display: flex; align-items: flex-end; }}
     .rooms-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }}
-    .room-card {{ border: 1px solid var(--border); border-radius: 12px; padding: 12px; }}
+    .room-card {{ border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: var(--input-bg); }}
     .room-card-top {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
     .room-code-badge {{ font-weight: 800; font-size: 15px; }}
     .occupant-list {{ list-style: none; padding: 0; margin: 8px 0 0; }}
     .occupant-list li {{ display: flex; justify-content: space-between; padding: 4px 0; border-top: 1px dashed var(--border); font-size: 13px; }}
     .mini-badge.plus {{ color: var(--ok); font-weight: 700; }}
     .mini-badge.minus {{ color: var(--danger); font-weight: 700; }}
-    .camera-panel {{ border: 1px solid var(--border); border-radius: 14px; padding: 14px; margin-bottom: 16px; background: rgba(37, 99, 235, 0.04); }}
+    .camera-panel {{ border: 1px solid var(--border); border-radius: 14px; padding: 14px; margin-bottom: 16px; background: rgba(37, 99, 235, 0.05); }}
     .camera-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
     .camera-viewport video {{ width: 100%; max-height: 320px; border-radius: 12px; background: #000; }}
     .checkbox-inline {{ display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }}
 
-    html[data-device="phone"] .container {{ max-width: 520px; }}
-    html[data-device="phone"] body {{ padding: 10px; }}
-    html[data-device="phone"] .glass-card {{ padding: 13px; border-radius: 14px; }}
-    html[data-device="phone"] .topbar {{ flex-direction: column; align-items: stretch; }}
-    html[data-device="phone"] .top-actions {{ width: 100%; }}
+    html[data-device="phone"] .container {{ max-width: 460px; }}
+    html[data-device="phone"] body {{ padding: 7px; font-size: 13px; }}
+    html[data-device="phone"] .glass-card {{ padding: 9px; border-radius: 11px; }}
+    html[data-device="phone"] .brand-logo {{ width: 32px; height: 32px; border-radius: 10px; }}
+    html[data-device="phone"] .brand-title {{ font-size: 15px; }}
+    html[data-device="phone"] .brand-sub,
+    html[data-device="phone"] .muted {{ font-size: 11px; }}
+    html[data-device="phone"] .topbar {{ gap: 7px; margin-bottom: 8px; }}
+    html[data-device="phone"] .top-actions {{ width: 100%; gap: 5px; }}
     html[data-device="phone"] .top-actions .btn,
-    html[data-device="phone"] .top-actions .input {{ flex: 1 1 auto; }}
-    html[data-device="phone"] .nav-tabs {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }}
-    html[data-device="phone"] .nav-tab {{ text-align: center; padding: 10px 8px; font-size: 13px; }}
-    html[data-device="phone"] .stats-strip {{ grid-template-columns: repeat(2, 1fr); gap: 8px; }}
-    html[data-device="phone"] .cell-btn {{ width: 42px; height: 42px; font-size: 16px; border-radius: 11px; }}
-    html[data-device="phone"] .phone-btn-group {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; }}
-    html[data-device="phone"] .phone-btn-group .inline-form {{ grid-column: 1 / -1; width: 100%; }}
-    html[data-device="phone"] .phone-btn-group .inline-form .btn {{ width: 100%; }}
-    html[data-device="phone"] .phone-btn-group .btn {{ min-height: 38px; }}
+    html[data-device="phone"] .top-actions .input {{ flex: 1 1 auto; padding: 5px 8px; font-size: 11px; border-radius: 8px; }}
+    html[data-device="phone"] .nav-tabs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 6px; margin-bottom: 8px; }}
+    html[data-device="phone"] .nav-tab {{ text-align: center; padding: 6px 5px; font-size: 11px; border-radius: 8px; }}
+    html[data-device="phone"] .stats-strip {{ grid-template-columns: repeat(4, 1fr); gap: 5px; margin-bottom: 8px; }}
+    html[data-device="phone"] .stat-tile {{ flex-direction: column; align-items: flex-start; padding: 6px 8px; border-radius: 9px; }}
+    html[data-device="phone"] .stat-tile span {{ font-size: 10px; color: var(--muted); }}
+    html[data-device="phone"] .stat-tile strong {{ font-size: 15px; }}
+    html[data-device="phone"] .section-header {{ gap: 6px; margin-bottom: 8px; }}
+    html[data-device="phone"] .section-header h2 {{ font-size: 15px; margin: 0 0 2px; }}
+    html[data-device="phone"] .btn {{ padding: 6px 9px; font-size: 11px; border-radius: 8px; }}
+    html[data-device="phone"] .btn-sm {{ padding: 5px 8px; font-size: 11px; }}
+    html[data-device="phone"] .input {{ padding: 6px 8px; font-size: 12px; border-radius: 8px; }}
+    html[data-device="phone"] .input-sm {{ padding: 5px 7px; font-size: 11px; }}
+    html[data-device="phone"] .cell-btn {{ width: 32px; height: 32px; font-size: 14px; border-radius: 8px; }}
+    html[data-device="phone"] .status-tag {{ font-size: 11px; }}
+    html[data-device="phone"] .chip {{ padding: 4px 8px; font-size: 11px; }}
+    html[data-device="phone"] .phone-btn-group {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px; width: 100%; }}
+    html[data-device="phone"] .phone-btn-group .inline-form {{ width: 100%; }}
+    html[data-device="phone"] .phone-btn-group .inline-form .btn,
+    html[data-device="phone"] .phone-btn-group .btn {{ width: 100%; min-height: 30px; padding: 5px 6px; font-size: 11px; }}
     html[data-device="phone"] .responsive-table thead {{ display: none; }}
+    html[data-device="phone"] .excel-grid-table {{ border: none; }}
     html[data-device="phone"] .responsive-table tr {{
-      display: block; border: 1px solid var(--border); border-radius: 12px;
-      padding: 10px; margin-bottom: 10px; background: rgba(255, 255, 255, 0.35);
-    }}
-    html[data-device="night"][data-device="phone"] .responsive-table tr {{
-      background: rgba(30, 41, 59, 0.55);
+      display: block; border: 1px solid var(--grid-border); border-radius: 10px;
+      padding: 7px 8px; margin-bottom: 7px; background: var(--input-bg);
     }}
     html[data-device="phone"] .responsive-table td {{
-      display: flex; justify-content: space-between; align-items: center; gap: 10px;
-      border-bottom: 1px dashed var(--border); padding: 7px 4px;
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      border: none; border-bottom: 1px dashed var(--border); padding: 4px 2px; font-size: 12px;
     }}
     html[data-device="phone"] .responsive-table td:last-child {{ border-bottom: none; }}
     html[data-device="phone"] .responsive-table td::before {{
-      content: attr(data-label); font-weight: 700; color: var(--muted); font-size: 12px; flex-shrink: 0;
+      content: attr(data-label); font-weight: 700; color: var(--muted); font-size: 11px; flex-shrink: 0;
     }}
+    html[data-device="phone"] .bulk-save-bar {{ flex-direction: column; align-items: stretch; gap: 8px; margin-top: 8px; padding-top: 8px; }}
+    html[data-device="phone"] .bulk-save-actions {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
 
     @media (max-width: 720px) {{
-      .container {{ max-width: 520px; }}
-      body {{ padding: 10px; }}
-      .topbar {{ flex-direction: column; align-items: stretch; }}
-      .nav-tabs {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }}
-      .stats-strip {{ grid-template-columns: repeat(2, 1fr); gap: 8px; }}
-      .cell-btn {{ width: 40px; height: 40px; font-size: 16px; }}
-      .phone-btn-group {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: 100%; }}
-      .phone-btn-group .inline-form {{ grid-column: 1 / -1; width: 100%; }}
-      .phone-btn-group .inline-form .btn {{ width: 100%; }}
+      .container {{ max-width: 480px; }}
+      body {{ padding: 8px; font-size: 13px; }}
+      .glass-card {{ padding: 10px; border-radius: 12px; }}
+      .topbar {{ flex-direction: column; align-items: stretch; gap: 8px; }}
+      .nav-tabs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; padding: 6px; }}
+      .nav-tab {{ text-align: center; padding: 7px 6px; font-size: 12px; }}
+      .stats-strip {{ grid-template-columns: repeat(2, 1fr); gap: 6px; }}
+      .cell-btn {{ width: 34px; height: 34px; font-size: 14px; }}
+      .phone-btn-group {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px; width: 100%; }}
+      .phone-btn-group .inline-form {{ width: 100%; }}
+      .phone-btn-group .inline-form .btn,
+      .phone-btn-group .btn {{ width: 100%; min-height: 32px; font-size: 11px; }}
     }}
   </style>
 </head>
@@ -1151,6 +1321,7 @@ def render_page(page_name):
   </main>
   <script>
     const CURRENT_DATE = "{esc(selected_date)}";
+    const BULK_API_URL = "{bulk_api_url}";
     let cameraStream = null;
 
     function tickUzClock() {{
@@ -1166,6 +1337,29 @@ def render_page(page_name):
     }}
     tickUzClock();
     setInterval(tickUzClock, 1000);
+
+    function refreshUnmarkedSummary() {{
+      const summary = document.getElementById("att-unmarked-summary");
+      if (!summary) return;
+      const rows = Array.from(document.querySelectorAll("#excel-attendance-table .excel-row"));
+      const missing = rows.filter(r => !["+", "-"].includes((r.dataset.status || "").trim()));
+      if (!rows.length) {{
+        summary.textContent = "O'quvchilar ro'yxati bo'sh.";
+      }} else if (missing.length === 0) {{
+        summary.textContent = `Barcha ${{rows.length}} nafar o'quvchi belgilangan. Saqlashga tayyor.`;
+      }} else {{
+        summary.textContent = `Belgilanmagan: ${{missing.length}} nafar (masalan: ${{missing[0].dataset.studentName || ""}})`;
+      }}
+    }}
+
+    function showAttendanceFeedback(type, message) {{
+      const box = document.getElementById("att-save-feedback");
+      if (!box) return;
+      box.className = `alert alert-${{type}}`;
+      box.textContent = message;
+      box.classList.remove("hidden");
+      box.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
+    }}
 
     function focusRow(row) {{
       if (!row) return;
@@ -1183,25 +1377,20 @@ def render_page(page_name):
       focusRow(rows[nextIdx]);
     }}
 
-    async function setRowPlus(row) {{
+    function setRowPlus(row) {{
       if (!row) return;
       const sid = row.dataset.studentId;
-      const res = await fetch("{url_for('api_attendance')}", {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{ student_id: sid, work_date: CURRENT_DATE, status: "+" }})
-      }});
-      if (res.ok) {{
-        row.dataset.status = "+";
-        row.querySelector(".plus-btn")?.classList.add("is-plus");
-        row.querySelector(".minus-btn")?.classList.remove("is-minus");
-        const tag = document.getElementById("tag-" + sid);
-        if (tag) tag.textContent = "Bor";
-        const rdisp = document.getElementById("reason-display-" + sid);
-        if (rdisp) rdisp.textContent = "";
-        document.getElementById("editor-" + sid)?.classList.add("hidden");
-        moveRow(1);
-      }}
+      row.dataset.status = "+";
+      row.classList.remove("needs-attention");
+      row.querySelector(".plus-btn")?.classList.add("is-plus");
+      row.querySelector(".minus-btn")?.classList.remove("is-minus");
+      const tag = document.getElementById("tag-" + sid);
+      if (tag) tag.textContent = "Bor (+)";
+      const rdisp = document.getElementById("reason-display-" + sid);
+      if (rdisp) rdisp.textContent = "";
+      document.getElementById("editor-" + sid)?.classList.add("hidden");
+      refreshUnmarkedSummary();
+      moveRow(1);
     }}
 
     function openRowMinus(row) {{
@@ -1223,34 +1412,76 @@ def render_page(page_name):
       }}
     }}
 
-    async function saveRowMinus(sid, row) {{
+    function saveRowMinus(sid, row) {{
       const rtype = document.getElementById("rtype-" + sid)?.value || "Sababli";
       const rnote = document.getElementById("rnote-" + sid)?.value || "";
-      const res = await fetch("{url_for('api_attendance')}", {{
-        method: "POST",
-        headers: {{ "Content-Type": "application/json" }},
-        body: JSON.stringify({{
+      if (row) {{
+        row.dataset.status = "-";
+        row.classList.remove("needs-attention");
+        row.querySelector(".minus-btn")?.classList.add("is-minus");
+        row.querySelector(".plus-btn")?.classList.remove("is-plus");
+      }}
+      const tag = document.getElementById("tag-" + sid);
+      if (tag) tag.textContent = "Yo'q (-)";
+      const rdisp = document.getElementById("reason-display-" + sid);
+      if (rdisp) rdisp.textContent = rnote ? `${{rtype}}: ${{rnote}}` : rtype;
+      document.getElementById("editor-" + sid)?.classList.add("hidden");
+      refreshUnmarkedSummary();
+      moveRow(1);
+    }}
+
+    async function saveAllAttendance() {{
+      const rows = Array.from(document.querySelectorAll("#excel-attendance-table .excel-row"));
+      if (!rows.length) return;
+
+      rows.forEach(r => r.classList.remove("needs-attention"));
+
+      const items = [];
+      for (const row of rows) {{
+        const sid = row.dataset.studentId;
+        const sname = row.dataset.studentName || "O'quvchi";
+        const status = (row.dataset.status || "").trim();
+        if (status !== "+" && status !== "-") {{
+          row.classList.add("needs-attention");
+          focusRow(row);
+          row.scrollIntoView({{ behavior: "smooth", block: "center" }});
+          showAttendanceFeedback("error", `Avval shu insonni davomatini oling, so'ng saqlaysiz: ${{sname}}`);
+          return;
+        }}
+        const rtype = status === "-" ? (document.getElementById("rtype-" + sid)?.value || "Sababli") : "";
+        const rnote = status === "-" ? (document.getElementById("rnote-" + sid)?.value || "") : "";
+        items.push({{
           student_id: sid,
-          work_date: CURRENT_DATE,
-          status: "-",
+          status: status,
           reason_type: rtype,
           reason_note: rnote
-        }})
-      }});
-      if (res.ok) {{
-        if (row) {{
-          row.dataset.status = "-";
-          row.querySelector(".minus-btn")?.classList.add("is-minus");
-          row.querySelector(".plus-btn")?.classList.remove("is-plus");
+        }});
+      }}
+
+      const btn = document.getElementById("btn-save-all-attendance");
+      if (btn) btn.disabled = true;
+
+      try {{
+        const res = await fetch(BULK_API_URL, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ work_date: CURRENT_DATE, items: items }})
+        }});
+        const data = await res.json().catch(() => ({{}}));
+        if (res.ok && data.ok) {{
+          showAttendanceFeedback("success", `${{items.length}} nafar o'quvchi davomati muvaffaqiyatli saqlandi.`);
+          refreshUnmarkedSummary();
+        }} else {{
+          showAttendanceFeedback("error", data.error || "Saqlashda xatolik yuz berdi.");
         }}
-        const tag = document.getElementById("tag-" + sid);
-        if (tag) tag.textContent = "Yo'q";
-        const rdisp = document.getElementById("reason-display-" + sid);
-        if (rdisp) rdisp.textContent = rnote ? `${{rtype}}: ${{rnote}}` : rtype;
-        document.getElementById("editor-" + sid)?.classList.add("hidden");
-        moveRow(1);
+      }} catch (err) {{
+        showAttendanceFeedback("error", "Internet yoki server bilan bog'lanishda xatolik.");
+      }} finally {{
+        if (btn) btn.disabled = false;
       }}
     }}
+
+    refreshUnmarkedSummary();
 
     document.addEventListener("keydown", (e) => {{
       if (!document.getElementById("excel-attendance-table")) return;
@@ -1265,9 +1496,9 @@ def render_page(page_name):
 
     function openCameraFromBtn(btn) {{
       if (!btn) return;
-      const sid = btn.dataset.studentId;
-      const sname = btn.dataset.studentName || "";
-      const pstatus = btn.dataset.phoneStatus || "Berildi";
+      const sid = btn.getAttribute("data-student-id");
+      const sname = btn.getAttribute("data-student-name") || "";
+      const pstatus = btn.getAttribute("data-phone-status") || "Berildi";
       openLiveCamera(sid, sname, pstatus);
     }}
 
@@ -1421,6 +1652,144 @@ def attendance_page():
     return render_page("attendance")
 
 
+@app.route("/attendance/export.xls")
+def export_attendance_excel():
+    guard = require_login(["ustoz", "superadmin"])
+    if guard:
+        return guard
+    ensure_day_rollover()
+    db = get_db()
+    selected_date = request.args.get("date") or today_str()
+    try:
+        datetime.strptime(selected_date, "%Y-%m-%d")
+    except ValueError:
+        selected_date = today_str()
+
+    class_filter = request.args.get("class_name", "ALL")
+    room_code_filter = request.args.get("room_code", "ALL")
+
+    students = fetch_students_with_attendance(db, selected_date)
+    if class_filter != "ALL":
+        students = [st for st in students if st["class_name"] == class_filter]
+    if room_code_filter != "ALL":
+        students = [st for st in students if st["room_code"] == room_code_filter]
+
+    present_c = sum(1 for st in students if st["status"] == "+")
+    absent_c = sum(1 for st in students if st["status"] == "-")
+    unmarked_c = len(students) - present_c - absent_c
+
+    body_rows = []
+    for i, st in enumerate(students, start=1):
+        st_label = "Bor (+)" if st["status"] == "+" else ("Yo'q (-)" if st["status"] == "-" else "Belgilanmagan")
+        reason_str = ""
+        if st["status"] == "-":
+            reason_str = f"{st['reason_type']}: {st['reason_note']}" if st["reason_note"] else st["reason_type"]
+        phone_str = st["phone_status"] or "Belgilanmagan"
+        if st["phone_time"]:
+            phone_str = f"{phone_str} ({st['phone_time']})"
+        body_rows.append(f"""
+        <tr>
+          <td>{i}</td>
+          <td>{html.escape(st["full_name"])}</td>
+          <td>{html.escape(st["class_name"])}</td>
+          <td>{html.escape(st["room_code"])} ({st["room_capacity"]} k.)</td>
+          <td>{html.escape(st_label)}</td>
+          <td>{html.escape(reason_str)}</td>
+          <td>{html.escape(phone_str)}</td>
+        </tr>
+        """)
+
+    xls_html = f"""<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    table {{ border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 12pt; }}
+    th, td {{ border: 1px solid #333; padding: 6px 8px; text-align: left; }}
+    th {{ background: #dbeafe; font-weight: bold; }}
+    .meta {{ margin-bottom: 10px; font-family: Arial, sans-serif; }}
+  </style>
+</head>
+<body>
+  <div class="meta">
+    <h3>Yotoqxona Davomat Hisoboti — {html.escape(format_uz_date(selected_date))}</h3>
+    <p>Jami: <strong>{len(students)}</strong> | Bor (+): <strong>{present_c}</strong> | Yo'q (-): <strong>{absent_c}</strong> | Belgilanmagan: <strong>{unmarked_c}</strong></p>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Ism-familiya</th>
+        <th>Sinf</th>
+        <th>Xona</th>
+        <th>Davomat</th>
+        <th>Sabab</th>
+        <th>Telefon holati</th>
+      </tr>
+    </thead>
+    <tbody>
+      {"".join(body_rows)}
+    </tbody>
+  </table>
+</body>
+</html>
+"""
+    fname = f"davomat_{selected_date}.xls"
+    return Response(
+        xls_html.encode("utf-8"),
+        mimetype="application/vnd.ms-excel; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"; filename*=UTF-8\'\'{quote(fname)}'},
+    )
+
+
+@app.route("/api/attendance/bulk", methods=["POST"])
+def api_attendance_bulk():
+    guard = require_login(["ustoz", "superadmin"], is_api=True)
+    if guard:
+        return guard
+    ensure_day_rollover()
+    data = request.get_json(silent=True) or {}
+    work_date = (data.get("work_date") or today_str()).strip()
+    try:
+        datetime.strptime(work_date, "%Y-%m-%d")
+    except ValueError:
+        work_date = today_str()
+
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False, "error": "Saqlash uchun ma'lumot topilmadi"}), 400
+
+    db = get_db()
+    for item in items:
+        sid = item.get("student_id")
+        status = (item.get("status") or "").strip()
+        if not sid or status not in ("+", "-"):
+            st_row = db.execute("SELECT full_name FROM students WHERE id = ?", (sid,)).fetchone()
+            st_name = st_row["full_name"] if st_row else "o'quvchi"
+            return jsonify({
+                "ok": False,
+                "error": f"Avval shu insonni davomatini oling, so'ng saqlaysiz: {st_name}"
+            }), 400
+
+    now_str = now_uz().strftime("%Y-%m-%d %H:%M:%S")
+    for item in items:
+        sid = item.get("student_id")
+        status = (item.get("status") or "").strip()
+        reason_type = (item.get("reason_type") or "").strip() if status == "-" else ""
+        reason_note = (item.get("reason_note") or "").strip() if status == "-" else ""
+        db.execute("""
+            INSERT INTO attendance (student_id, work_date, status, reason_type, reason_note, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(student_id, work_date) DO UPDATE SET
+                status = excluded.status,
+                reason_type = excluded.reason_type,
+                reason_note = excluded.reason_note,
+                updated_at = excluded.updated_at
+        """, (sid, work_date, status, reason_type, reason_note, now_str))
+    db.commit()
+    return jsonify({"ok": True, "saved_count": len(items)})
+
+
 @app.route("/api/attendance", methods=["POST"])
 def api_attendance():
     guard = require_login(["ustoz", "superadmin"], is_api=True)
@@ -1468,8 +1837,8 @@ def set_phone_status():
     ensure_day_rollover()
     student_id = request.form.get("student_id")
     work_date = request.form.get("work_date") or today_str()
-    phone_status = (request.form.get("phone_status") or "").strip()
-    if student_id and phone_status in ("Berildi", "Olingan", "Berilmadi"):
+    phone_status = normalize_phone_status(request.form.get("phone_status"))
+    if student_id and phone_status in ("Berildi", "Biz bermadik", "O'quvchi oldi", "O'quvchi bermadi"):
         db = get_db()
         now_dt = now_uz()
         now_hm = now_dt.strftime("%H:%M")
@@ -1504,15 +1873,15 @@ def set_all_phones_not_given():
     for st in students:
         db.execute("""
             INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_time, updated_at)
-            VALUES (?, ?, 'Berilmadi', 0, ?, ?)
+            VALUES (?, ?, 'Biz bermadik', 0, ?, ?)
             ON CONFLICT(student_id, work_date) DO UPDATE SET
-                phone_status = 'Berilmadi',
+                phone_status = 'Biz bermadik',
                 phone_given = 0,
                 phone_time = excluded.phone_time,
                 updated_at = excluded.updated_at
         """, (st["id"], work_date, now_hm, now_str))
     db.commit()
-    flash("Barcha o'quvchilarga 'Berilmadi' belgilandi.", "success")
+    flash("Barcha o'quvchilarga 'Biz bermadik' belgilandi.", "success")
     return redirect(url_for("phones_page", date=work_date))
 
 
@@ -1524,7 +1893,7 @@ def save_phone_photo():
     ensure_day_rollover()
     student_id = request.form.get("student_id")
     work_date = request.form.get("work_date") or today_str()
-    phone_status = (request.form.get("phone_status") or "Berildi").strip()
+    phone_status = normalize_phone_status(request.form.get("phone_status")) or "Berildi"
     photo_b64 = request.form.get("photo_base64") or ""
 
     rel_photo = ""
