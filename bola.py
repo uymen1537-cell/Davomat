@@ -3,7 +3,7 @@ import time
 import html
 import sqlite3
 import base64
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from flask import (
     Flask, request, redirect, url_for, session, flash,
     get_flashed_messages, g, jsonify
@@ -19,6 +19,8 @@ DB_PATH = os.environ.get("YOTOQXONA_DB_PATH") or os.path.join(BASE_DIR, "yotoqxo
 UPLOAD_DIR = os.environ.get("YOTOQXONA_UPLOAD_DIR") or os.path.join(BASE_DIR, "static", "uploads")
 TALABALAR_FILE = os.environ.get("YOTOQXONA_TALABALAR_FILE") or os.path.join(BASE_DIR, "talabalar.txt")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+UZ_TZ = timezone(timedelta(hours=5))
 
 DEFAULT_STUDENTS_TXT = """# Ism Familiya | Sinf | Xona | Sig'im (6 yoki 4)
 Mamadaliyev Shoxbozbek | 9-A | 12c | 4
@@ -59,6 +61,10 @@ FAVICON_DATA_URI = (
     "%3Cpath d='M16 33L32 19l16 14v15H38V37H26v11H16V33z' fill='%23ffffff'/%3E"
     "%3C/svg%3E"
 )
+
+
+def now_uz():
+    return datetime.now(UZ_TZ)
 
 
 def esc(val):
@@ -114,14 +120,14 @@ def close_db(error):
 
 
 def today_str():
-    return date.today().strftime("%Y-%m-%d")
+    return now_uz().strftime("%Y-%m-%d")
 
 
 def format_uz_date(iso_date):
     try:
         dt = datetime.strptime(iso_date, "%Y-%m-%d")
     except ValueError:
-        dt = datetime.now()
+        dt = now_uz()
     months = [
         "", "Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun",
         "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr"
@@ -134,7 +140,7 @@ def format_uz_date(iso_date):
 
 
 def auto_theme_by_hour():
-    hour = datetime.now().hour
+    hour = now_uz().hour
     return "day" if 6 <= hour < 18 else "night"
 
 
@@ -393,7 +399,10 @@ def render_page(page_name):
     class_filter = request.args.get("class_name", "ALL")
     room_code_filter = request.args.get("room_code", "ALL")
 
-    now_hm = datetime.now().strftime("%H:%M")
+    now_dt = now_uz()
+    now_hm = now_dt.strftime("%H:%M")
+    now_clock_str = now_dt.strftime("%H:%M:%S")
+
     sup_rows = db.execute("SELECT * FROM supervisors ORDER BY slot_number").fetchall()
     supervisors = []
     active_duty_list = []
@@ -550,7 +559,7 @@ def render_page(page_name):
             <div>Belgilanmagan: <strong>{unmarked_count}</strong></div>
           </div>
           <div class="chip-row mb-16">{class_chips_html}</div>
-          <a href="{url_for('chef_page')}" class="btn btn-primary">Yangilash</a>
+          <a href="{url_for('chef_page', date=selected_date)}" class="btn btn-primary">Yangilash</a>
         </section>
         """
     else:
@@ -618,7 +627,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Excel Davomat ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Qatorni tanlang yoki &uarr;/&darr; bilan yuring: <strong>+</strong> bossangiz "Bor" bo'lib keyingi qatorga o'tadi, <strong>-</strong> bossangiz sabab ochiladi.</p>
+                  <p class="muted">Har bir kunning davomati alohida saqlanadi. Yuqoridagi sana maydonidan istalgan kunni (masalan 21-sanani) ko'rishingiz mumkin.</p>
                 </div>
                 <form method="GET" action="{url_for('attendance_page')}" class="filter-bar">
                   <input type="hidden" name="date" value="{esc(selected_date)}" />
@@ -682,8 +691,8 @@ def render_page(page_name):
             <section class="glass-card section-box">
               <div class="section-header">
                 <div>
-                  <h2>Telefon Nazorati — Berildi / Olingan / Berilmadi</h2>
-                  <p class="muted">Berildi yoki Olingan bosilganda kamera oynasi ochiladi. Brauzer ruxsat so'ramasa ham pastdagi tugma orqali rasmga olib darhol yuborishingiz mumkin.</p>
+                  <h2>Telefon Nazorati ({esc(format_uz_date(selected_date))})</h2>
+                  <p class="muted">Vaqt Toshkent (UTC+5) bo'yicha yoziladi va tanlangan sana uchun saqlanadi.</p>
                 </div>
                 <form method="POST" action="{url_for('set_all_phones_not_given')}" onsubmit="return confirm('Ro\'yxatdagi barcha o\'quvchilarga \'Berilmadi\' belgilansinmi?');">
                   <input type="hidden" name="work_date" value="{esc(selected_date)}" />
@@ -868,7 +877,9 @@ def render_page(page_name):
             {LOGO_BADGE_HTML}
             <div>
               <div class="brand-title">Yotoqxona Nazorati</div>
-              <div class="brand-sub">{esc(format_uz_date(selected_date))} &middot; Navbatchi: <strong>{duty_banner_text}</strong></div>
+              <div class="brand-sub">
+                {esc(format_uz_date(selected_date))} &middot; Soat: <strong id="uz-live-clock">{esc(now_clock_str)}</strong> (UTC+5) &middot; Navbatchi: <strong>{duty_banner_text}</strong>
+              </div>
             </div>
           </div>
           <div class="top-actions">
@@ -1135,6 +1146,20 @@ def render_page(page_name):
     const CURRENT_DATE = "{esc(selected_date)}";
     let cameraStream = null;
 
+    function tickUzClock() {{
+      const el = document.getElementById("uz-live-clock");
+      if (!el) return;
+      const now = new Date();
+      const uzMs = now.getTime() + (now.getTimezoneOffset() + 300) * 60000;
+      const d = new Date(uzMs);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      el.textContent = `${{hh}}:${{mm}}:${{ss}}`;
+    }}
+    tickUzClock();
+    setInterval(tickUzClock, 1000);
+
     function focusRow(row) {{
       if (!row) return;
       document.querySelectorAll(".excel-row").forEach(r => r.classList.remove("active-row"));
@@ -1258,7 +1283,7 @@ def render_page(page_name):
       if (!isSecure || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
         if (captureBtn) captureBtn.classList.add("hidden");
         if (errBox) {{
-          errBox.textContent = "Brauzer jonli kamera ruxsatini ochmadi (HTTPS yoki localhost talab qilinadi). 'Kamera / Galereyadan Rasmga Olish va Saqlash' tugmasini bosing.";
+          errBox.textContent = "Jonli kamera faqat HTTPS yoki localhost da ishlaydi. 'Kamera / Galereyadan Rasmga Olish va Saqlash' tugmasini bosing.";
           errBox.classList.remove("hidden");
         }}
         return;
@@ -1274,7 +1299,7 @@ def render_page(page_name):
       }} catch (err) {{
         if (captureBtn) captureBtn.classList.add("hidden");
         if (errBox) {{
-          errBox.textContent = "Kamera ruxsati so'ralmadi yoki bloklangan (" + (err.name || err.message || err) + "). 'Kamera / Galereyadan Rasmga Olish va Saqlash' tugmasini bosing.";
+          errBox.textContent = "Kamera ochilmadi (" + (err.name || err.message || err) + "). 'Kamera / Galereyadan Rasmga Olish va Saqlash' tugmasini bosing.";
           errBox.classList.remove("hidden");
         }}
       }}
@@ -1398,7 +1423,7 @@ def api_attendance():
         return jsonify({"ok": False, "error": "Noto'g'ri ma'lumot"}), 400
 
     db = get_db()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now_uz().strftime("%Y-%m-%d %H:%M:%S")
     db.execute("""
         INSERT INTO attendance (student_id, work_date, status, reason_type, reason_note, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -1431,8 +1456,9 @@ def set_phone_status():
     phone_status = (request.form.get("phone_status") or "").strip()
     if student_id and phone_status in ("Berildi", "Olingan", "Berilmadi"):
         db = get_db()
-        now_hm = datetime.now().strftime("%H:%M")
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_dt = now_uz()
+        now_hm = now_dt.strftime("%H:%M")
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         phone_given = 1 if phone_status == "Berildi" else 0
         db.execute("""
             INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_time, updated_at)
@@ -1456,8 +1482,9 @@ def set_all_phones_not_given():
     ensure_day_rollover()
     work_date = request.form.get("work_date") or today_str()
     db = get_db()
-    now_hm = datetime.now().strftime("%H:%M")
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_dt = now_uz()
+    now_hm = now_dt.strftime("%H:%M")
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     students = db.execute("SELECT id FROM students").fetchall()
     for st in students:
         db.execute("""
@@ -1500,8 +1527,9 @@ def save_phone_photo():
 
     if student_id:
         db = get_db()
-        now_hm = datetime.now().strftime("%H:%M")
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_dt = now_uz()
+        now_hm = now_dt.strftime("%H:%M")
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         phone_given = 1 if phone_status == "Berildi" else 0
         db.execute("""
             INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_photo, phone_time, updated_at)
@@ -1622,7 +1650,7 @@ def superadmin_toggle_ontime():
     slot_number = request.form.get("slot_number")
     on_time = 1 if request.form.get("on_time") == "1" else 0
     work_date = request.form.get("work_date") or today_str()
-    arrived_at = datetime.now().strftime("%H:%M") if on_time == 1 else ""
+    arrived_at = now_uz().strftime("%H:%M") if on_time == 1 else ""
     if slot_number:
         db = get_db()
         db.execute(
