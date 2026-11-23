@@ -19,10 +19,28 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("YOTOQXONA_DB_PATH") or os.path.join(BASE_DIR, "yotoqxona.db")
-UPLOAD_DIR = os.environ.get("YOTOQXONA_UPLOAD_DIR") or os.path.join(BASE_DIR, "static", "uploads")
-TALABALAR_FILE = os.environ.get("YOTOQXONA_TALABALAR_FILE") or os.path.join(BASE_DIR, "talabalar.txt")
+PERSIST_DIR = os.environ.get("YOTOQXONA_DATA_DIR") or os.path.join(os.path.dirname(BASE_DIR), "yotoqxona_data")
+os.makedirs(PERSIST_DIR, exist_ok=True)
+
+DB_PATH = os.environ.get("YOTOQXONA_DB_PATH") or os.path.join(PERSIST_DIR, "yotoqxona.db")
+UPLOAD_DIR = os.environ.get("YOTOQXONA_UPLOAD_DIR") or os.path.join(PERSIST_DIR, "uploads")
+TALABALAR_FILE = os.environ.get("YOTOQXONA_TALABALAR_FILE") or os.path.join(PERSIST_DIR, "talabalar.txt")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Eski joyda (BASE_DIR ichida) baza yoki talabalar.txt bo'lsa, bir marta PERSIST_DIR ga ko'chiramiz
+_legacy_db = os.path.join(BASE_DIR, "yotoqxona.db")
+if not os.path.exists(DB_PATH) and os.path.exists(_legacy_db):
+    try:
+        os.replace(_legacy_db, DB_PATH)
+    except OSError:
+        pass
+
+_legacy_txt = os.path.join(BASE_DIR, "talabalar.txt")
+if not os.path.exists(TALABALAR_FILE) and os.path.exists(_legacy_txt):
+    try:
+        os.replace(_legacy_txt, TALABALAR_FILE)
+    except OSError:
+        pass
 
 UZ_TZ = timezone(timedelta(hours=5))
 
@@ -244,8 +262,6 @@ def col_letter(idx_1based):
 
 
 def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths):
-    """Yagona tashqi kutubxonasiz to'g'ri formatlangan .xlsx fayl yaratadi."""
-    # style index: 0 = default, 1 = title bold, 2 = summary muted, 3 = table header bold+fill+border, 4 = data cell border, 5 = number cell border
     sheet_rows_xml = []
 
     def cell_xml(r_idx, c_idx, val, style_idx=4, is_num=False):
@@ -255,22 +271,17 @@ def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths):
         s_val = xml_escape(str(val if val is not None else ""))
         return f'<c r="{ref}" s="{style_idx}" t="inlineStr"><is><t xml:space="preserve">{s_val}</t></is></c>'
 
-    # Row 1: Title
     sheet_rows_xml.append(
         f'<row r="1" ht="24" customHeight="1">{cell_xml(1, 1, title_line, style_idx=1)}</row>'
     )
-    # Row 2: Summary
     sheet_rows_xml.append(
         f'<row r="2" ht="20" customHeight="1">{cell_xml(2, 1, summary_line, style_idx=2)}</row>'
     )
-    # Row 3: Blank spacer
     sheet_rows_xml.append('<row r="3" ht="10" customHeight="1"/>')
 
-    # Row 4: Table headers
     hdr_cells = "".join(cell_xml(4, c + 1, h, style_idx=3) for c, h in enumerate(headers))
     sheet_rows_xml.append(f'<row r="4" ht="24" customHeight="1">{hdr_cells}</row>')
 
-    # Data rows starting at row 5
     for offset, r_vals in enumerate(rows_data):
         r_num = 5 + offset
         cells = []
@@ -765,7 +776,7 @@ def render_page(page_name):
                 for rc in room_codes
             )
             export_url = url_for(
-                "export_attendance_excel",
+                "export_attendance_excel_xlsx",
                 date=selected_date,
                 class_name=class_filter,
                 room_code=room_code_filter,
@@ -823,7 +834,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Katta Excel Davomat Jadvali ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing — sahifa qayta ochilsa ham bazadan saqlangan holat o'chmaydi.</p>
+                  <p class="muted">Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing — baza alohida papkada saqlanadi va kod yangilanganda o'chmaydi.</p>
                 </div>
                 <div class="filter-bar">
                   <form method="GET" action="{att_form_url}" class="filter-bar">
@@ -1802,9 +1813,9 @@ def attendance_page():
     return render_page("attendance")
 
 
-@app.route("/attendance/export.xls")
 @app.route("/attendance/export.xlsx")
-def export_attendance_excel():
+@app.route("/attendance/export.xls")
+def export_attendance_excel_xlsx():
     guard = require_login(["ustoz", "superadmin"])
     if guard:
         return guard
@@ -1859,7 +1870,10 @@ def export_attendance_excel():
     return Response(
         xlsx_bytes,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"; filename*=UTF-8\'\'{quote(fname)}'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"; filename*=UTF-8\'\'{quote(fname)}',
+            "Cache-Control": "no-store",
+        },
     )
 
 
