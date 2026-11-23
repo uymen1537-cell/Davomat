@@ -441,11 +441,14 @@ def render_page(page_name):
     role = current_role()
     theme = active_theme()
     device_mode = detect_device_mode()
-    selected_date = request.args.get("date") or today_str()
+    cur_today = today_str()
+    selected_date = request.args.get("date") or cur_today
     try:
         datetime.strptime(selected_date, "%Y-%m-%d")
     except ValueError:
-        selected_date = today_str()
+        selected_date = cur_today
+
+    is_other_date = (selected_date != cur_today)
 
     class_filter = request.args.get("class_name", "ALL")
     room_code_filter = request.args.get("room_code", "ALL")
@@ -601,10 +604,14 @@ def render_page(page_name):
         endpoint_name = request.endpoint if request.endpoint in (
             "attendance_page", "phones_page", "students_page", "rooms_page", "superadmin_page"
         ) else "attendance_page"
-        today_url = url_for(endpoint_name, date=today_str())
+        today_url = url_for(endpoint_name, date=cur_today)
         today_btn = (
-            f'<a href="{today_url}" class="btn btn-primary btn-sm">Bugun</a>'
-            if selected_date != today_str() else ""
+            f'<a href="{today_url}" class="btn btn-primary btn-sm">Bugunga qaytish ({esc(cur_today)})</a>'
+            if is_other_date else ""
+        )
+        other_date_banner = (
+            f'<div class="alert alert-warn">Diqqat: Siz hozir <strong>{esc(selected_date)}</strong> sanasidagi davomatni ko\'ryapsiz (Bugungi sana: <strong>{esc(cur_today)}</strong>).</div>'
+            if is_other_date else ""
         )
 
         sub_content = ""
@@ -676,7 +683,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Katta Excel Davomat Jadvali ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Katakchalarda + / - belgilang, pastda "Hammasini saqlash" tugmasini bosing yoki istalgan payt Excel yuklab oling.</p>
+                  <p class="muted">Har kun uchun davomat alohida toza boshlanadi. Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing.</p>
                 </div>
                 <div class="filter-bar">
                   <form method="GET" action="{att_form_url}" class="filter-bar">
@@ -1010,6 +1017,8 @@ def render_page(page_name):
           </div>
         </header>
 
+        {other_date_banner}
+
         <nav class="nav-tabs glass-card">
           <a href="{att_nav_url}" class="nav-tab {att_act}">1. Davomat</a>
           <a href="{phones_nav_url}" class="nav-tab {ph_act}">2. Telefon</a>
@@ -1210,6 +1219,7 @@ def render_page(page_name):
     .alert {{ padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; font-weight: 600; }}
     .alert-error {{ background: rgba(220, 38, 38, 0.15); color: var(--danger); border: 1px solid rgba(220, 38, 38, 0.35); }}
     .alert-success {{ background: rgba(22, 163, 74, 0.15); color: var(--ok); border: 1px solid rgba(22, 163, 74, 0.35); }}
+    .alert-warn {{ background: rgba(217, 119, 6, 0.16); color: var(--warn); border: 1px solid rgba(217, 119, 6, 0.35); }}
     .bulk-save-bar {{
       display: flex;
       flex-wrap: wrap;
