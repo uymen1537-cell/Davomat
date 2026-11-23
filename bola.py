@@ -40,20 +40,24 @@ MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 60
 failed_logins = {}
 
-LOGO_DATA_URI = (
-    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
-    "%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E"
-    "%3Cstop offset='0%25' stop-color='%232563eb'/%3E"
-    "%3Cstop offset='100%25' stop-color='%230ea5e9'/%3E%3C/linearGradient%3E%3C/defs%3E"
-    "%3Crect width='64' height='64' rx='18' fill='url(%23g)'/%3E"
-    "%3Cpath d='M16 33L32 19l16 14v15H38V37H26v11H16V33z' fill='%23ffffff'/%3E"
-    "%3C/svg%3E"
-)
-
 LOGO_BADGE_HTML = (
     '<span class="brand-logo" aria-hidden="true">'
-    f'<img src="{LOGO_DATA_URI}" alt="Logo" />'
+    '<svg viewBox="0 0 64 64" width="42" height="42" xmlns="http://www.w3.org/2000/svg">'
+    '<defs><linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0%" stop-color="#2563eb"/>'
+    '<stop offset="100%" stop-color="#0ea5e9"/>'
+    '</linearGradient></defs>'
+    '<rect width="64" height="64" rx="18" fill="url(#brandGrad)"/>'
+    '<path d="M16 33L32 19l16 14v15H38V37H26v11H16V33z" fill="#ffffff"/>'
+    '</svg>'
     '</span>'
+)
+
+FAVICON_DATA_URI = (
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+    "%3Crect width='64' height='64' rx='18' fill='%232563eb'/%3E"
+    "%3Cpath d='M16 33L32 19l16 14v15H38V37H26v11H16V33z' fill='%23ffffff'/%3E"
+    "%3C/svg%3E"
 )
 
 
@@ -677,7 +681,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Telefon Nazorati — Berildi / Olingan / Berilmadi</h2>
-                  <p class="muted">Berildi yoki Olingan belgilanganda jonli kamera ochiladi. Berilmadi esa tepadan hammaga bir tugmada qo'yiladi.</p>
+                  <p class="muted">Berildi yoki Olingan belgilanganda jonli kamera ochiladi. Agar kamera ruxsati berilmasa, rasmni kamera orqali tanlab ham yuborish mumkin.</p>
                 </div>
                 <form method="POST" action="{url_for('set_all_phones_not_given')}" onsubmit="return confirm('Ro\'yxatdagi barcha o\'quvchilarga \'Berilmadi\' belgilansinmi?');">
                   <input type="hidden" name="work_date" value="{esc(selected_date)}" />
@@ -702,7 +706,11 @@ def render_page(page_name):
                 </div>
                 <div id="camera-error" class="alert alert-error hidden"></div>
                 <div class="camera-actions">
-                  <button type="button" class="btn btn-primary full-width" onclick="capturePhoto()">Rasmga olish va Tasdiqlash</button>
+                  <button type="button" id="btn-capture-live" class="btn btn-primary full-width" onclick="capturePhoto()">Rasmga olish va Tasdiqlash</button>
+                  <label class="btn btn-soft full-width mt-12">
+                    Kamera / Galereyadan rasm tanlash
+                    <input type="file" id="camera-file-input" accept="image/*" capture="environment" class="hidden" onchange="handleFileCapture(this)" />
+                  </label>
                 </div>
                 <form id="photo-submit-form" method="POST" action="{url_for('save_phone_photo')}" class="hidden">
                   <input type="hidden" name="student_id" id="photo-student-id" />
@@ -751,7 +759,7 @@ def render_page(page_name):
                 </div>
                 <div>
                   <label class="field-label">Sinf</label>
-                  <input type="text" name="class_name" class="input" placeholder="Masalan: 9-A sinf" required />
+                  <input type="text" name="class_name" class="input" placeholder="Masalan: 9-A" required />
                 </div>
                 <div>
                   <label class="field-label">Xona (1c-12c)</label>
@@ -907,7 +915,7 @@ def render_page(page_name):
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Yotoqxona Nazorati</title>
-  <link rel="icon" type="image/png" href="/static/logo.png?v=2" />
+  <link rel="icon" type="image/svg+xml" href="{FAVICON_DATA_URI}" />
   <style>
     :root {{
       --bg: #eef2f7;
@@ -957,7 +965,7 @@ def render_page(page_name):
       display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
       box-shadow: 0 6px 16px rgba(37, 99, 235, 0.22);
     }}
-    .brand-logo img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+    .brand-logo svg {{ width: 100%; height: 100%; display: block; }}
     .brand-title {{ font-size: 20px; font-weight: 700; }}
     .brand-sub, .muted {{ color: var(--muted); font-size: 13px; }}
     .top-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }}
@@ -1183,18 +1191,40 @@ def render_page(page_name):
       const modal = document.getElementById("camera-modal");
       const errBox = document.getElementById("camera-error");
       const video = document.getElementById("camera-video");
+      const captureBtn = document.getElementById("btn-capture-live");
+      const fileInput = document.getElementById("camera-file-input");
       if (!modal || !video) return;
+
+      closeCamera();
       document.getElementById("camera-target-name").textContent = `${{studentName}} — ${{phoneStatus}}`;
       document.getElementById("photo-student-id").value = studentId;
       document.getElementById("photo-phone-status").value = phoneStatus;
+      if (fileInput) fileInput.value = "";
       errBox?.classList.add("hidden");
+      if (captureBtn) captureBtn.classList.remove("hidden");
       modal.classList.remove("hidden");
-      try {{
-        cameraStream = await navigator.mediaDevices.getUserMedia({{ video: {{ facingMode: "environment" }}, audio: false }});
-        video.srcObject = cameraStream;
-      }} catch (err) {{
+      modal.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+        if (captureBtn) captureBtn.classList.add("hidden");
         if (errBox) {{
-          errBox.textContent = "Kamerani ochib bo'lmadi: " + (err.message || err);
+          errBox.textContent = "Brauzer jonli kamerani qo'llab-quvvatlamaydi (HTTPS talab qilinishi mumkin). Pastdagi 'Kamera / Galereyadan rasm tanlash' tugmasidan foydalaning.";
+          errBox.classList.remove("hidden");
+        }}
+        return;
+      }}
+
+      try {{
+        cameraStream = await navigator.mediaDevices.getUserMedia({{
+          video: {{ facingMode: {{ ideal: "environment" }} }},
+          audio: false
+        }});
+        video.srcObject = cameraStream;
+        await video.play();
+      }} catch (err) {{
+        if (captureBtn) captureBtn.classList.add("hidden");
+        if (errBox) {{
+          errBox.textContent = "Jonli kamerani ochib bo'lmadi (" + (err.name || err.message || err) + "). Pastdagi 'Kamera / Galereyadan rasm tanlash' tugmasini bosing.";
           errBox.classList.remove("hidden");
         }}
       }}
@@ -1205,6 +1235,8 @@ def render_page(page_name):
         cameraStream.getTracks().forEach(t => t.stop());
         cameraStream = null;
       }}
+      const video = document.getElementById("camera-video");
+      if (video) video.srcObject = null;
       document.getElementById("camera-modal")?.classList.add("hidden");
     }}
 
@@ -1219,355 +1251,29 @@ def render_page(page_name):
       closeCamera();
       document.getElementById("photo-submit-form")?.submit();
     }}
+
+    function handleFileCapture(input) {{
+      const file = input.files && input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(ev) {{
+        const img = new Image();
+        img.onload = function() {{
+          const canvas = document.getElementById("camera-canvas");
+          if (!canvas) return;
+          const maxW = 960;
+          const scale = img.width > maxW ? (maxW / img.width) : 1;
+          canvas.width = Math.round(img.width * scale) || 640;
+          canvas.height = Math.round(img.height * scale) || 480;
+          canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+          document.getElementById("photo-base64").value = canvas.toDataURL("image/jpeg", 0.85);
+          closeCamera();
+          document.getElementById("photo-submit-form")?.submit();
+        }};
+        img.src = ev.target.result;
+      }};
+      reader.readAsDataURL(file);
+    }}
   </script>
 </body>
 </html>
-"""
-
-
-@app.route("/")
-def index():
-    role = current_role()
-    if role:
-        return redirect(role_home_url(role))
-    return redirect(url_for("login_page"))
-
-
-@app.route("/login", methods=["GET"])
-def login_page():
-    if current_role():
-        return redirect(role_home_url(current_role()))
-    return render_page("login")
-
-
-@app.route("/login", methods=["POST"])
-def login():
-    ip = get_client_ip()
-    locked, rem = is_login_locked(ip)
-    if locked:
-        flash(f"Ko'p xato urinish. {rem} soniyadan so'ng qayta urining.", "error")
-        return redirect(url_for("login_page"))
-
-    role = (request.form.get("role") or "").strip()
-    pin = (request.form.get("pin") or "").strip()
-    if role in PINS and pin == PINS[role]:
-        clear_failed_login(ip)
-        session["role"] = role
-        flash("Tizimga muvaffaqiyatli kirdingiz.", "success")
-        return redirect(role_home_url(role))
-
-    record_failed_login(ip)
-    flash("Rol yoki PIN-kod noto'g'ri.", "error")
-    return redirect(url_for("login_page"))
-
-
-@app.route("/logout", methods=["POST"])
-def logout():
-    session.pop("role", None)
-    flash("Tizimdan chiqdingiz.", "success")
-    return redirect(url_for("login_page"))
-
-
-@app.route("/attendance")
-def attendance_page():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    return render_page("attendance")
-
-
-@app.route("/api/attendance", methods=["POST"])
-def api_attendance():
-    guard = require_login(["ustoz", "superadmin"], is_api=True)
-    if guard:
-        return guard
-    ensure_day_rollover()
-    data = request.get_json(silent=True) or request.form
-    student_id = data.get("student_id")
-    work_date = data.get("work_date") or today_str()
-    status = (data.get("status") or "").strip()
-    reason_type = (data.get("reason_type") or "").strip() if status == "-" else ""
-    reason_note = (data.get("reason_note") or "").strip() if status == "-" else ""
-
-    if not student_id or status not in ("+", "-"):
-        return jsonify({"ok": False, "error": "Noto'g'ri ma'lumot"}), 400
-
-    db = get_db()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db.execute("""
-        INSERT INTO attendance (student_id, work_date, status, reason_type, reason_note, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(student_id, work_date) DO UPDATE SET
-            status = excluded.status,
-            reason_type = excluded.reason_type,
-            reason_note = excluded.reason_note,
-            updated_at = excluded.updated_at
-    """, (student_id, work_date, status, reason_type, reason_note, now_str))
-    db.commit()
-    return jsonify({"ok": True})
-
-
-@app.route("/phones")
-def phones_page():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    return render_page("phones")
-
-
-@app.route("/phones/set-status", methods=["POST"])
-def set_phone_status():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    ensure_day_rollover()
-    student_id = request.form.get("student_id")
-    work_date = request.form.get("work_date") or today_str()
-    phone_status = (request.form.get("phone_status") or "").strip()
-    if student_id and phone_status in ("Berildi", "Olingan", "Berilmadi"):
-        db = get_db()
-        now_hm = datetime.now().strftime("%H:%M")
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        phone_given = 1 if phone_status == "Berildi" else 0
-        db.execute("""
-            INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(student_id, work_date) DO UPDATE SET
-                phone_status = excluded.phone_status,
-                phone_given = excluded.phone_given,
-                phone_time = excluded.phone_time,
-                updated_at = excluded.updated_at
-        """, (student_id, work_date, phone_status, phone_given, now_hm, now_str))
-        db.commit()
-        flash(f"Holat '{phone_status}' qilib belgilandi.", "success")
-    return redirect(url_for("phones_page", date=work_date))
-
-
-@app.route("/phones/set-all-not-given", methods=["POST"])
-def set_all_phones_not_given():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    ensure_day_rollover()
-    work_date = request.form.get("work_date") or today_str()
-    db = get_db()
-    now_hm = datetime.now().strftime("%H:%M")
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    students = db.execute("SELECT id FROM students").fetchall()
-    for st in students:
-        db.execute("""
-            INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_time, updated_at)
-            VALUES (?, ?, 'Berilmadi', 0, ?, ?)
-            ON CONFLICT(student_id, work_date) DO UPDATE SET
-                phone_status = 'Berilmadi',
-                phone_given = 0,
-                phone_time = excluded.phone_time,
-                updated_at = excluded.updated_at
-        """, (st["id"], work_date, now_hm, now_str))
-    db.commit()
-    flash("Barcha o'quvchilarga 'Berilmadi' belgilandi.", "success")
-    return redirect(url_for("phones_page", date=work_date))
-
-
-@app.route("/phones/save-photo", methods=["POST"])
-def save_phone_photo():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    ensure_day_rollover()
-    student_id = request.form.get("student_id")
-    work_date = request.form.get("work_date") or today_str()
-    phone_status = (request.form.get("phone_status") or "Berildi").strip()
-    photo_b64 = request.form.get("photo_base64") or ""
-
-    rel_photo = ""
-    if "," in photo_b64:
-        _, b64_data = photo_b64.split(",", 1)
-        try:
-            raw_bytes = base64.b64decode(b64_data)
-            fname = f"phone_{student_id}_{int(time.time())}.jpg"
-            fpath = os.path.join(UPLOAD_DIR, fname)
-            with open(fpath, "wb") as f:
-                f.write(raw_bytes)
-            rel_photo = f"uploads/{fname}"
-        except Exception:
-            rel_photo = ""
-
-    if student_id:
-        db = get_db()
-        now_hm = datetime.now().strftime("%H:%M")
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        phone_given = 1 if phone_status == "Berildi" else 0
-        db.execute("""
-            INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_photo, phone_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(student_id, work_date) DO UPDATE SET
-                phone_status = excluded.phone_status,
-                phone_given = excluded.phone_given,
-                phone_photo = CASE WHEN excluded.phone_photo != '' THEN excluded.phone_photo ELSE attendance.phone_photo END,
-                phone_time = excluded.phone_time,
-                updated_at = excluded.updated_at
-        """, (student_id, work_date, phone_status, phone_given, rel_photo, now_hm, now_str))
-        db.commit()
-        flash("Rasm va holat saqlandi.", "success")
-    return redirect(url_for("phones_page", date=work_date))
-
-
-@app.route("/students")
-def students_page():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    return render_page("students")
-
-
-@app.route("/students/add", methods=["POST"])
-def add_student():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    ensure_day_rollover()
-    work_date = request.form.get("work_date") or today_str()
-    full_name = (request.form.get("full_name") or "").strip()
-    class_name = (request.form.get("class_name") or "").strip()
-    room_id = request.form.get("room_id")
-
-    if full_name and class_name and room_id:
-        db = get_db()
-        room = db.execute("SELECT id, capacity FROM rooms WHERE id = ?", (room_id,)).fetchone()
-        occ = db.execute("SELECT COUNT(*) AS c FROM students WHERE room_id = ?", (room_id,)).fetchone()["c"]
-        if room and occ < room["capacity"]:
-            db.execute(
-                "INSERT INTO students (full_name, class_name, room_id) VALUES (?, ?, ?)",
-                (full_name, class_name, room_id)
-            )
-            db.commit()
-            rewrite_talabalar_txt(db)
-            flash("O'quvchi qo'shildi va talabalar.txt ga saqlandi.", "success")
-        else:
-            flash("Tanlangan xona to'lgan.", "error")
-    return redirect(url_for("students_page", date=work_date))
-
-
-@app.route("/students/delete/<int:student_id>", methods=["POST"])
-def delete_student(student_id):
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    work_date = request.form.get("work_date") or today_str()
-    db = get_db()
-    db.execute("DELETE FROM students WHERE id = ?", (student_id,))
-    db.commit()
-    rewrite_talabalar_txt(db)
-    flash("O'quvchi o'chirildi va talabalar.txt yangilandi.", "success")
-    return redirect(url_for("students_page", date=work_date))
-
-
-@app.route("/rooms")
-def rooms_page():
-    guard = require_login(["ustoz", "superadmin"])
-    if guard:
-        return guard
-    return render_page("rooms")
-
-
-@app.route("/chef")
-def chef_page():
-    guard = require_login(["oshpaz", "ustoz", "superadmin"])
-    if guard:
-        return guard
-    return render_page("chef")
-
-
-@app.route("/superadmin")
-def superadmin_page():
-    guard = require_login(["superadmin"])
-    if guard:
-        return guard
-    return render_page("superadmin")
-
-
-@app.route("/superadmin/supervisor", methods=["POST"])
-def superadmin_update_supervisor():
-    guard = require_login(["superadmin"])
-    if guard:
-        return guard
-    slot_number = request.form.get("slot_number")
-    teacher_name = (request.form.get("teacher_name") or "").strip()
-    shift_start = (request.form.get("shift_start") or "").strip()
-    shift_end = (request.form.get("shift_end") or "").strip()
-    work_date = request.form.get("work_date") or today_str()
-    if slot_number and teacher_name and shift_start and shift_end:
-        db = get_db()
-        db.execute("""
-            UPDATE supervisors
-            SET teacher_name = ?, shift_start = ?, shift_end = ?
-            WHERE slot_number = ?
-        """, (teacher_name, shift_start, shift_end, slot_number))
-        db.commit()
-        flash("Navbatchi ma'lumotlari yangilandi.", "success")
-    return redirect(url_for("superadmin_page", date=work_date))
-
-
-@app.route("/superadmin/ontime", methods=["POST"])
-def superadmin_toggle_ontime():
-    guard = require_login(["superadmin"])
-    if guard:
-        return guard
-    slot_number = request.form.get("slot_number")
-    on_time = 1 if request.form.get("on_time") == "1" else 0
-    work_date = request.form.get("work_date") or today_str()
-    arrived_at = datetime.now().strftime("%H:%M") if on_time == 1 else ""
-    if slot_number:
-        db = get_db()
-        db.execute(
-            "UPDATE supervisors SET on_time = ?, arrived_at = ? WHERE slot_number = ?",
-            (on_time, arrived_at, slot_number)
-        )
-        db.commit()
-    return redirect(url_for("superadmin_page", date=work_date))
-
-
-@app.route("/superadmin/auto-theme", methods=["POST"])
-def superadmin_toggle_auto_theme():
-    guard = require_login(["superadmin"])
-    if guard:
-        return guard
-    val = "1" if request.form.get("auto_theme") == "1" else "0"
-    work_date = request.form.get("work_date") or today_str()
-    db = get_db()
-    db.execute(
-        "INSERT INTO settings (key, value) VALUES ('auto_theme', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (val,)
-    )
-    db.commit()
-    return redirect(url_for("superadmin_page", date=work_date))
-
-
-@app.route("/settings/theme", methods=["POST"])
-def set_theme():
-    guard = require_login(["ustoz", "oshpaz", "superadmin"])
-    if guard:
-        return guard
-    theme = request.form.get("theme")
-    next_url = request.form.get("next_url") or role_home_url(current_role())
-    if theme in ("day", "night"):
-        session["manual_theme"] = theme
-    return redirect(next_url)
-
-
-@app.route("/settings/device", methods=["POST"])
-def set_device():
-    guard = require_login(["ustoz", "oshpaz", "superadmin"])
-    if guard:
-        return guard
-    dev = request.form.get("device_mode")
-    next_url = request.form.get("next_url") or role_home_url(current_role())
-    if dev in ("phone", "desktop"):
-        session["device_mode"] = dev
-    return redirect(next_url)
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
