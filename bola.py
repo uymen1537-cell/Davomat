@@ -24,11 +24,12 @@ PERSIST_DIR = os.environ.get("YOTOQXONA_DATA_DIR") or os.path.join(os.path.dirna
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
 DB_PATH = os.environ.get("YOTOQXONA_DB_PATH") or os.path.join(PERSIST_DIR, "yotoqxona.db")
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+
 UPLOAD_DIR = os.environ.get("YOTOQXONA_UPLOAD_DIR") or os.path.join(PERSIST_DIR, "uploads")
 TALABALAR_FILE = os.environ.get("YOTOQXONA_TALABALAR_FILE") or os.path.join(PERSIST_DIR, "talabalar.txt")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Eski joyda (BASE_DIR ichida) baza yoki talabalar.txt bo'lsa, bir marta PERSIST_DIR ga ko'chiramiz
 _legacy_db = os.path.join(BASE_DIR, "yotoqxona.db")
 if not os.path.exists(DB_PATH) and os.path.exists(_legacy_db):
     try:
@@ -514,14 +515,6 @@ def ensure_day_rollover():
 
     sync_students_from_txt(db)
 
-    students = cur.execute("SELECT id FROM students").fetchall()
-    for st in students:
-        cur.execute("""
-            INSERT OR IGNORE INTO attendance (student_id, work_date, status, phone_status, phone_given)
-            VALUES (?, ?, '', '', 0)
-        """, (st["id"], cur_date))
-    db.commit()
-
 
 def is_time_in_shift(now_hm, start_hm, end_hm):
     if start_hm <= end_hm:
@@ -567,14 +560,6 @@ def active_theme():
 
 
 def fetch_students_with_attendance(db, work_date):
-    all_students_raw = db.execute("SELECT id FROM students").fetchall()
-    for s in all_students_raw:
-        db.execute("""
-            INSERT OR IGNORE INTO attendance (student_id, work_date, status, phone_status, phone_given)
-            VALUES (?, ?, '', '', 0)
-        """, (s["id"], work_date))
-    db.commit()
-
     rows = db.execute("""
         SELECT s.id, s.full_name, s.class_name, s.room_id,
                r.code AS room_code, r.sub_label AS room_sub_label, r.capacity AS room_capacity,
@@ -857,7 +842,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Katta Excel Davomat Jadvali ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Katakchalarda + / - belgilang va pastda "Hammasini saqlash" bosing — 1 kunlik yoki 1 oylik (.xlsx) hisobotni yuklab olishingiz mumkin.</p>
+                  <p class="muted">Har bir kun bazada saqlanib qoladi — 1 kunlik yoki 1 oylik (.xlsx) hisobotni istalgan payt yuklab olish mumkin.</p>
                 </div>
                 <div class="filter-bar">
                   <form method="GET" action="{att_form_url}" class="filter-bar">
@@ -1205,16 +1190,17 @@ def render_page(page_name):
         </nav>
 
         <section class="stats-strip">
-          <div class="stat-tile glass-card"><span>Jami</span><strong>{total_count}</strong></div>
-          <div class="stat-tile glass-card"><span>Bor (+)</span><strong>{present_count}</strong></div>
-          <div class="stat-tile glass-card"><span>Yo'q (-)</span><strong>{absent_count}</strong></div>
-          <div class="stat-tile glass-card"><span>Belgilanmagan</span><strong>{unmarked_count}</strong></div>
+          <div class="stat-tile glass-card"><span>Jami</span><strong id="stat-total">{total_count}</strong></div>
+          <div class="stat-tile glass-card"><span>Bor (+)</span><strong id="stat-present">{present_count}</strong></div>
+          <div class="stat-tile glass-card"><span>Yo'q (-)</span><strong id="stat-absent">{absent_count}</strong></div>
+          <div class="stat-tile glass-card"><span>Belgilanmagan</span><strong id="stat-unmarked">{unmarked_count}</strong></div>
         </section>
 
         {sub_content}
         """
 
     bulk_api_url = url_for("api_attendance_bulk")
+    single_api_url = url_for("api_attendance")
 
     return f"""<!DOCTYPE html>
 <html lang="uz" data-theme="{esc(theme)}" data-device="{esc(device_mode)}">
@@ -1508,6 +1494,7 @@ def render_page(page_name):
   <script>
     const CURRENT_DATE = "{esc(selected_date)}";
     const BULK_API_URL = "{bulk_api_url}";
+    const SINGLE_API_URL = "{single_api_url}";
     let cameraStream = null;
 
     function tickUzClock() {{
@@ -1524,6 +1511,24 @@ def render_page(page_name):
     tickUzClock();
     setInterval(tickUzClock, 1000);
 
+    function refreshStatsFromTable() {{
+      const rows = Array.from(document.querySelectorAll("#excel-attendance-table .excel-row"));
+      if (!rows.length) return;
+      let p = 0, a = 0, u = 0;
+      for (const r of rows) {{
+        const st = (r.dataset.status || "").trim();
+        if (st === "+") p += 1;
+        else if (st === "-") a += 1;
+        else u += 1;
+      }}
+      const elP = document.getElementById("stat-present");
+      const elA = document.getElementById("stat-absent");
+      const elU = document.getElementById("stat-unmarked");
+      if (elP) elP.textContent = String(p);
+      if (elA) elA.textContent = String(a);
+      if (elU) elU.textContent = String(u);
+    }}
+
     function refreshUnmarkedSummary() {{
       const summary = document.getElementById("att-unmarked-summary");
       if (!summary) return;
@@ -1532,7 +1537,7 @@ def render_page(page_name):
       if (!rows.length) {{
         summary.textContent = "O'quvchilar ro'yxati bo'sh.";
       }} else if (missing.length === 0) {{
-        summary.textContent = `Barcha ${{rows.length}} nafar o'quvchi belgilangan. Saqlashga tayyor.`;
+        summary.textContent = `Barcha ${{rows.length}} nafar o'quvchi belgilangan (${{CURRENT_DATE}}).`;
       }} else {{
         summary.textContent = `Belgilanmagan: ${{missing.length}} nafar (masalan: ${{missing[0].dataset.studentName || ""}})`;
       }}
@@ -1544,7 +1549,6 @@ def render_page(page_name):
       box.className = `alert alert-${{type}}`;
       box.textContent = message;
       box.classList.remove("hidden");
-      box.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
     }}
 
     function focusRow(row) {{
@@ -1563,6 +1567,27 @@ def render_page(page_name):
       focusRow(rows[nextIdx]);
     }}
 
+    async function persistSingleAttendance(sid, status, reasonType, reasonNote) {{
+      try {{
+        const res = await fetch(SINGLE_API_URL, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            student_id: sid,
+            work_date: CURRENT_DATE,
+            status: status,
+            reason_type: reasonType || "",
+            reason_note: reasonNote || ""
+          }})
+        }});
+        if (!res.ok) {{
+          showAttendanceFeedback("error", "Bazaga yozishda xatolik yuz berdi.");
+        }}
+      }} catch (e) {{
+        showAttendanceFeedback("error", "Internet yoki server bilan bog'lanishda xatolik.");
+      }}
+    }}
+
     function setRowPlus(row) {{
       if (!row) return;
       const sid = row.dataset.studentId;
@@ -1575,7 +1600,9 @@ def render_page(page_name):
       const rdisp = document.getElementById("reason-display-" + sid);
       if (rdisp) rdisp.textContent = "";
       document.getElementById("editor-" + sid)?.classList.add("hidden");
+      refreshStatsFromTable();
       refreshUnmarkedSummary();
+      persistSingleAttendance(sid, "+", "", "");
       moveRow(1);
     }}
 
@@ -1612,7 +1639,9 @@ def render_page(page_name):
       const rdisp = document.getElementById("reason-display-" + sid);
       if (rdisp) rdisp.textContent = rnote ? `${{rtype}}: ${{rnote}}` : rtype;
       document.getElementById("editor-" + sid)?.classList.add("hidden");
+      refreshStatsFromTable();
       refreshUnmarkedSummary();
+      persistSingleAttendance(sid, "-", rtype, rnote);
       moveRow(1);
     }}
 
@@ -1655,8 +1684,9 @@ def render_page(page_name):
         }});
         const data = await res.json().catch(() => ({{}}));
         if (res.ok && data.ok) {{
-          showAttendanceFeedback("success", `${{items.length}} nafar o'quvchi davomati bazaga saqlandi. Sahifani qayta ochsangiz ham o'chmaydi.`);
+          refreshStatsFromTable();
           refreshUnmarkedSummary();
+          showAttendanceFeedback("success", `${{items.length}} nafar o'quvchi davomati (${{CURRENT_DATE}}) bazaga saqlandi.`);
         }} else {{
           showAttendanceFeedback("error", data.error || "Saqlashda xatolik yuz berdi.");
         }}
@@ -2070,7 +2100,12 @@ def api_attendance():
     ensure_day_rollover()
     data = request.get_json(silent=True) or request.form
     student_id = data.get("student_id")
-    work_date = data.get("work_date") or today_str()
+    work_date = (data.get("work_date") or today_str()).strip()
+    try:
+        datetime.strptime(work_date, "%Y-%m-%d")
+    except ValueError:
+        work_date = today_str()
+
     status = (data.get("status") or "").strip()
     reason_type = (data.get("reason_type") or "").strip() if status == "-" else ""
     reason_note = (data.get("reason_note") or "").strip() if status == "-" else ""
