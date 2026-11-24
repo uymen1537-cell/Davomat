@@ -14,13 +14,26 @@ from flask import (
     get_flashed_messages, g, jsonify, Response
 )
 
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "yotoqxona-super-admin-2026-change-me")
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
+DATABASE_URL = (os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+USE_POSTGRES = bool(DATABASE_URL and HAS_PSYCOPG2)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PERSIST_DIR = os.environ.get("YOTOQXONA_DATA_DIR") or os.path.join(os.path.dirname(BASE_DIR), "yotoqxona_data")
+PERSIST_DIR = os.environ.get("YOTOQXONA_DATA_DIR") or os.path.join(BASE_DIR, "yotoqxona_data")
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
 DB_PATH = os.environ.get("YOTOQXONA_DB_PATH") or os.path.join(PERSIST_DIR, "yotoqxona.db")
@@ -31,7 +44,7 @@ TALABALAR_FILE = os.environ.get("YOTOQXONA_TALABALAR_FILE") or os.path.join(PERS
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 _legacy_db = os.path.join(BASE_DIR, "yotoqxona.db")
-if not os.path.exists(DB_PATH) and os.path.exists(_legacy_db):
+if not USE_POSTGRES and not os.path.exists(DB_PATH) and os.path.exists(_legacy_db):
     try:
         os.replace(_legacy_db, DB_PATH)
     except OSError:
@@ -87,6 +100,57 @@ FAVICON_DATA_URI = (
 )
 
 
+class DBAdapter:
+    def __init__(self, conn, is_pg):
+        self._conn = conn
+        self._is_pg = is_pg
+
+    def _adapt_sql(self, sql):
+        if not self._is_pg:
+            return sql
+        s = sql.replace("?", "%s")
+        s = s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+        s = s.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        if "INSERT INTO" in s and "ON CONFLICT" not in s and "settings" in s:
+            s = s.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        if "INSERT INTO" in s and "ON CONFLICT" not in s and "rooms" in s:
+            s = s.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        return s
+
+    def execute(self, sql, params=()):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if self._is_pg else self._conn.cursor()
+        cur.execute(self._adapt_sql(sql), params)
+        return cur
+
+    def executemany(self, sql, seq_of_params):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if self._is_pg else self._conn.cursor()
+        cur.executemany(self._adapt_sql(sql), seq_of_params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+def open_raw_db():
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        return DBAdapter(conn, True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return DBAdapter(conn, False)
+
+
+def _scalar_count(row):
+    if row is None:
+        return 0
+    if isinstance(row, dict):
+        return list(row.values())[0]
+    return row[0]
+
+
 def now_uz():
     return datetime.now(UZ_TZ)
 
@@ -132,8 +196,7 @@ def clear_failed_login(ip):
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = open_raw_db()
     return g.db
 
 
@@ -193,7 +256,6 @@ def ensure_talabalar_txt_exists():
 
 def sync_students_from_txt(db):
     ensure_talabalar_txt_exists()
-    cur = db.cursor()
     with open(TALABALAR_FILE, "r", encoding="utf-8") as f:
         for line in f:
             raw = line.strip()
@@ -207,28 +269,28 @@ def sync_students_from_txt(db):
             room_code = parts[2].lower()
             capacity = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 6
 
-            room = cur.execute(
+            room = db.execute(
                 "SELECT id, capacity FROM rooms WHERE LOWER(code) = ? AND capacity = ?",
                 (room_code, capacity),
             ).fetchone()
             if not room:
-                room = cur.execute(
+                room = db.execute(
                     "SELECT id, capacity FROM rooms WHERE LOWER(code) = ? ORDER BY capacity DESC",
                     (room_code,),
                 ).fetchone()
             if not room:
                 continue
 
-            exists = cur.execute(
+            exists = db.execute(
                 "SELECT id FROM students WHERE full_name = ? AND class_name = ? AND room_id = ?",
                 (full_name, class_name, room["id"]),
             ).fetchone()
-            occ = cur.execute(
+            occ = _scalar_count(db.execute(
                 "SELECT COUNT(*) AS c FROM students WHERE room_id = ?",
                 (room["id"],),
-            ).fetchone()["c"]
+            ).fetchone())
             if not exists and occ < room["capacity"]:
-                cur.execute(
+                db.execute(
                     "INSERT INTO students (full_name, class_name, room_id) VALUES (?, ?, ?)",
                     (full_name, class_name, room["id"]),
                 )
@@ -237,6 +299,11 @@ def sync_students_from_txt(db):
 
 def rewrite_talabalar_txt(db):
     rows = db.execute("""
+        SELECT s.full_name, s.class_name, r.code, r.capacity
+        FROM students s
+        JOIN rooms r ON s.room_id = r.id
+        ORDER BY CAST(SUBSTRING(r.code FROM '^[0-9]+') AS INTEGER), r.capacity DESC, s.full_name
+    """ if USE_POSTGRES else """
         SELECT s.full_name, s.class_name, r.code, r.capacity
         FROM students s
         JOIN rooms r ON s.room_id = r.id
@@ -400,11 +467,9 @@ def build_xlsx_bytes(title_line, summary_line, headers, rows_data, col_widths, c
 
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    cur = db.cursor()
+    db = open_raw_db()
 
-    cur.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS rooms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT NOT NULL,
@@ -414,7 +479,7 @@ def init_db():
         )
     """)
 
-    cur.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS students (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             full_name TEXT NOT NULL,
@@ -424,7 +489,7 @@ def init_db():
         )
     """)
 
-    cur.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             student_id INTEGER NOT NULL,
@@ -442,18 +507,19 @@ def init_db():
         )
     """)
 
-    cols = [r[1] for r in cur.execute("PRAGMA table_info(attendance)").fetchall()]
-    if "phone_status" not in cols:
-        cur.execute("ALTER TABLE attendance ADD COLUMN phone_status TEXT DEFAULT ''")
+    if not USE_POSTGRES:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(attendance)").fetchall()]
+        if "phone_status" not in cols:
+            db.execute("ALTER TABLE attendance ADD COLUMN phone_status TEXT DEFAULT ''")
 
-    cur.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )
     """)
 
-    cur.execute("""
+    db.execute("""
         CREATE TABLE IF NOT EXISTS supervisors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             slot_number INTEGER UNIQUE NOT NULL,
@@ -465,27 +531,25 @@ def init_db():
         )
     """)
 
-    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_theme', '1')")
-    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_seen_date', ?)", (today_str(),))
+    db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_theme', '1')")
+    db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('last_seen_date', ?)", (today_str(),))
 
-    cur.execute("SELECT COUNT(*) FROM supervisors")
-    if cur.fetchone()[0] == 0:
+    if _scalar_count(db.execute("SELECT COUNT(*) FROM supervisors").fetchone()) == 0:
         default_supervisors = [
             (1, "1-Ustoz", "07:00", "15:00", 0, ""),
             (2, "2-Ustoz", "15:00", "23:00", 0, ""),
             (3, "3-Ustoz", "23:00", "07:00", 0, ""),
         ]
-        cur.executemany("""
+        db.executemany("""
             INSERT INTO supervisors (slot_number, teacher_name, shift_start, shift_end, on_time, arrived_at)
             VALUES (?, ?, ?, ?, ?, ?)
         """, default_supervisors)
 
-    cur.execute("SELECT COUNT(*) FROM rooms")
-    if cur.fetchone()[0] == 0:
+    if _scalar_count(db.execute("SELECT COUNT(*) FROM rooms").fetchone()) == 0:
         for i in range(1, 13):
             code = f"{i}c"
-            cur.execute("INSERT OR IGNORE INTO rooms (code, sub_label, capacity) VALUES (?, '6 kishilik xona', 6)", (code,))
-            cur.execute("INSERT OR IGNORE INTO rooms (code, sub_label, capacity) VALUES (?, '4 kishilik xona', 4)", (code,))
+            db.execute("INSERT OR IGNORE INTO rooms (code, sub_label, capacity) VALUES (?, '6 kishilik xona', 6)", (code,))
+            db.execute("INSERT OR IGNORE INTO rooms (code, sub_label, capacity) VALUES (?, '4 kishilik xona', 4)", (code,))
 
     db.commit()
     sync_students_from_txt(db)
@@ -498,19 +562,18 @@ init_db()
 
 def ensure_day_rollover():
     db = get_db()
-    cur = db.cursor()
     cur_date = today_str()
 
     try:
-        row = cur.execute("SELECT value FROM settings WHERE key = 'last_seen_date'").fetchone()
-    except sqlite3.OperationalError:
+        row = db.execute("SELECT value FROM settings WHERE key = 'last_seen_date'").fetchone()
+    except Exception:
         init_db()
-        row = cur.execute("SELECT value FROM settings WHERE key = 'last_seen_date'").fetchone()
+        row = db.execute("SELECT value FROM settings WHERE key = 'last_seen_date'").fetchone()
 
     last_date = row["value"] if row else cur_date
     if last_date != cur_date:
-        cur.execute("UPDATE settings SET value = ? WHERE key = 'last_seen_date'", (cur_date,))
-        cur.execute("UPDATE supervisors SET on_time = 0, arrived_at = ''")
+        db.execute("UPDATE settings SET value = ? WHERE key = 'last_seen_date'", (cur_date,))
+        db.execute("UPDATE supervisors SET on_time = 0, arrived_at = ''")
         db.commit()
 
     sync_students_from_txt(db)
@@ -560,7 +623,12 @@ def active_theme():
 
 
 def fetch_students_with_attendance(db, work_date):
-    rows = db.execute("""
+    order_expr = (
+        "CAST(SUBSTRING(r.code FROM '^[0-9]+') AS INTEGER), r.capacity DESC, s.full_name"
+        if USE_POSTGRES else
+        "CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name"
+    )
+    rows = db.execute(f"""
         SELECT s.id, s.full_name, s.class_name, s.room_id,
                r.code AS room_code, r.sub_label AS room_sub_label, r.capacity AS room_capacity,
                COALESCE(a.status, '') AS status,
@@ -573,7 +641,7 @@ def fetch_students_with_attendance(db, work_date):
         FROM students s
         JOIN rooms r ON s.room_id = r.id
         LEFT JOIN attendance a ON a.student_id = s.id AND a.work_date = ?
-        ORDER BY CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name
+        ORDER BY {order_expr}
     """, (work_date,)).fetchall()
 
     students = []
@@ -650,10 +718,15 @@ def render_page(page_name):
         for cname in classes
     )
 
-    all_rooms = db.execute("""
+    room_order_expr = (
+        "CAST(SUBSTRING(code FROM '^[0-9]+') AS INTEGER), capacity DESC"
+        if USE_POSTGRES else
+        "CAST(substr(code, 1, length(code)-1) AS INTEGER), capacity DESC"
+    )
+    all_rooms = db.execute(f"""
         SELECT id, code, sub_label, capacity
         FROM rooms
-        ORDER BY CAST(substr(code, 1, length(code)-1) AS INTEGER), capacity DESC
+        ORDER BY {room_order_expr}
     """).fetchall()
 
     rooms_grouped = []
@@ -669,8 +742,8 @@ def render_page(page_name):
             "present_in_room": sum(1 for o in occupants if o["status"] == "+")
         })
 
-    total_attendance_records = db.execute("SELECT COUNT(*) AS c FROM attendance WHERE status != ''").fetchone()["c"]
-    total_photos = db.execute("SELECT COUNT(*) AS c FROM attendance WHERE phone_photo != ''").fetchone()["c"]
+    total_attendance_records = _scalar_count(db.execute("SELECT COUNT(*) AS c FROM attendance WHERE status != ''").fetchone())
+    total_photos = _scalar_count(db.execute("SELECT COUNT(*) AS c FROM attendance WHERE phone_photo != ''").fetchone())
     auto_theme_row = db.execute("SELECT value FROM settings WHERE key = 'auto_theme'").fetchone()
     auto_theme_enabled = (auto_theme_row["value"] == "1") if auto_theme_row else True
 
@@ -694,6 +767,8 @@ def render_page(page_name):
 
     device_btn_label = "Kompyuter rejimi" if device_mode == "phone" else "Telefon rejimi"
     device_next_val = "desktop" if device_mode == "phone" else "phone"
+
+    db_mode_badge = "PostgreSQL (Doimiy baza)" if USE_POSTGRES else "SQLite (Lokal fayl)"
 
     if page_name == "login":
         login_url = url_for("login")
@@ -842,7 +917,7 @@ def render_page(page_name):
               <div class="section-header">
                 <div>
                   <h2>Katta Excel Davomat Jadvali ({esc(format_uz_date(selected_date))})</h2>
-                  <p class="muted">Har bir kun bazada saqlanib qoladi — 1 kunlik yoki 1 oylik (.xlsx) hisobotni istalgan payt yuklab olish mumkin.</p>
+                  <p class="muted">Baza rejimi: <strong>{esc(db_mode_badge)}</strong> &middot; Har bir kun alohida saqlanadi, 1 oylik (.xlsx) hisobotni yuklab olish mumkin.</p>
                 </div>
                 <div class="filter-bar">
                   <form method="GET" action="{att_form_url}" class="filter-bar">
@@ -1119,6 +1194,7 @@ def render_page(page_name):
             <section class="glass-card section-box">
               <h2>Super Admin Boshqaruvi</h2>
               <div class="chip-row mt-12 mb-16">
+                <span class="chip">Baza turi: <strong>{esc(db_mode_badge)}</strong></span>
                 <span class="chip">Davomat yozuvlari: <strong>{total_attendance_records}</strong></span>
                 <span class="chip">Kamera rasmlari: <strong>{total_photos}</strong></span>
               </div>
@@ -1223,9 +1299,7 @@ def render_page(page_name):
       --ok: #16a34a;
       --warn: #d97706;
     }}
-    html[data-theme="day"] {{
-      color-scheme: light;
-    }}
+    html[data-theme="day"] {{ color-scheme: light; }}
     html[data-theme="night"] {{
       color-scheme: dark;
       --bg: #0b1120;
@@ -1253,12 +1327,8 @@ def render_page(page_name):
       backdrop-filter: blur(10px);
     }}
     .topbar {{
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 12px;
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; margin-bottom: 12px;
     }}
     .brand-area {{ display: flex; align-items: center; gap: 12px; }}
     .brand-logo {{
@@ -1271,57 +1341,20 @@ def render_page(page_name):
     .brand-sub, .muted {{ color: var(--muted); font-size: 13px; }}
     .top-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }}
     .inline-form {{ display: inline-flex; margin: 0; }}
-    .nav-tabs {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 12px;
-    }}
-    .nav-tab {{
-      text-decoration: none;
-      color: var(--text);
-      padding: 8px 14px;
-      border-radius: 10px;
-      font-weight: 600;
-      font-size: 14px;
-    }}
+    .nav-tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
+    .nav-tab {{ text-decoration: none; color: var(--text); padding: 8px 14px; border-radius: 10px; font-weight: 600; font-size: 14px; }}
     .nav-tab.active {{ background: var(--primary); color: #fff; }}
-    .stats-strip {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 10px;
-      margin-bottom: 14px;
-    }}
+    .stats-strip {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 14px; }}
     .stat-tile {{ display: flex; justify-content: space-between; align-items: center; }}
     .stat-tile strong {{ font-size: 20px; }}
-    .section-header {{
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 12px;
-    }}
+    .section-header {{ display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }}
     .filter-bar {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
     .table-wrap {{ overflow-x: auto; }}
     .excel-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-    .excel-table th, .excel-table td {{
-      padding: 10px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-      vertical-align: middle;
-    }}
-    .excel-grid-table {{
-      border: 1px solid var(--grid-border);
-    }}
-    .excel-grid-table th {{
-      background: rgba(37, 99, 235, 0.08);
-      border: 1px solid var(--grid-border);
-      font-weight: 700;
-    }}
-    .excel-grid-table td {{
-      border: 1px solid var(--grid-border);
-    }}
+    .excel-table th, .excel-table td {{ padding: 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }}
+    .excel-grid-table {{ border: 1px solid var(--grid-border); }}
+    .excel-grid-table th {{ background: rgba(37, 99, 235, 0.08); border: 1px solid var(--grid-border); font-weight: 700; }}
+    .excel-grid-table td {{ border: 1px solid var(--grid-border); }}
     .excel-row.active-row {{ outline: 2px solid var(--primary); background: rgba(37, 99, 235, 0.07); }}
     .excel-row.needs-attention {{ outline: 2px solid var(--danger); background: rgba(220, 38, 38, 0.10); }}
     .att-actions {{ display: flex; align-items: center; gap: 6px; }}
@@ -1338,22 +1371,13 @@ def render_page(page_name):
       padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border);
       background: var(--input-bg); color: var(--text); font-size: 14px;
     }}
-    select.input, select.input option, select.input optgroup {{
-      background-color: var(--input-bg);
-      color: var(--text);
-    }}
+    select.input, select.input option, select.input optgroup {{ background-color: var(--input-bg); color: var(--text); }}
     html[data-theme="night"] select.input,
     html[data-theme="night"] select.input option,
-    html[data-theme="night"] select.input optgroup {{
-      background-color: #111827;
-      color: #f8fafc;
-    }}
+    html[data-theme="night"] select.input optgroup {{ background-color: #111827; color: #f8fafc; }}
     html[data-theme="day"] select.input,
     html[data-theme="day"] select.input option,
-    html[data-theme="day"] select.input optgroup {{
-      background-color: #ffffff;
-      color: #0f172a;
-    }}
+    html[data-theme="day"] select.input optgroup {{ background-color: #ffffff; color: #0f172a; }}
     .input-sm {{ padding: 6px 8px; font-size: 13px; }}
     .btn {{
       padding: 9px 14px; border-radius: 10px; border: 1px solid transparent;
@@ -1383,14 +1407,8 @@ def render_page(page_name):
     .alert-success {{ background: rgba(22, 163, 74, 0.15); color: var(--ok); border: 1px solid rgba(22, 163, 74, 0.35); }}
     .alert-warn {{ background: rgba(217, 119, 6, 0.16); color: var(--warn); border: 1px solid rgba(217, 119, 6, 0.35); }}
     .bulk-save-bar {{
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-top: 14px;
-      padding-top: 14px;
-      border-top: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
     }}
     .bulk-save-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
     .login-wrapper {{ display: flex; justify-content: center; padding: 32px 0; }}
@@ -1954,7 +1972,12 @@ def export_attendance_monthly_xlsx():
     class_filter = request.args.get("class_name", "ALL")
     room_code_filter = request.args.get("room_code", "ALL")
 
-    sql = """
+    order_expr = (
+        "CAST(SUBSTRING(r.code FROM '^[0-9]+') AS INTEGER), r.capacity DESC, s.full_name"
+        if USE_POSTGRES else
+        "CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name"
+    )
+    sql = f"""
         SELECT s.id, s.full_name, s.class_name, r.code AS room_code, r.capacity AS room_capacity
         FROM students s
         JOIN rooms r ON s.room_id = r.id
@@ -1967,7 +1990,7 @@ def export_attendance_monthly_xlsx():
     if room_code_filter != "ALL":
         sql += " AND r.code = ?"
         params.append(room_code_filter)
-    sql += " ORDER BY CAST(substr(r.code, 1, length(r.code)-1) AS INTEGER), r.capacity DESC, s.full_name"
+    sql += f" ORDER BY {order_expr}"
 
     students_rows = db.execute(sql, params).fetchall()
 
@@ -2044,6 +2067,29 @@ def export_attendance_monthly_xlsx():
     )
 
 
+def _upsert_attendance(db, student_id, work_date, status, reason_type, reason_note, now_str):
+    if USE_POSTGRES:
+        db.execute("""
+            INSERT INTO attendance (student_id, work_date, status, reason_type, reason_note, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(student_id, work_date) DO UPDATE SET
+                status = EXCLUDED.status,
+                reason_type = EXCLUDED.reason_type,
+                reason_note = EXCLUDED.reason_note,
+                updated_at = EXCLUDED.updated_at
+        """, (student_id, work_date, status, reason_type, reason_note, now_str))
+    else:
+        db.execute("""
+            INSERT INTO attendance (student_id, work_date, status, reason_type, reason_note, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(student_id, work_date) DO UPDATE SET
+                status = excluded.status,
+                reason_type = excluded.reason_type,
+                reason_note = excluded.reason_note,
+                updated_at = excluded.updated_at
+        """, (student_id, work_date, status, reason_type, reason_note, now_str))
+
+
 @app.route("/api/attendance/bulk", methods=["POST"])
 def api_attendance_bulk():
     guard = require_login(["ustoz", "superadmin"], is_api=True)
@@ -2079,15 +2125,7 @@ def api_attendance_bulk():
         status = (item.get("status") or "").strip()
         reason_type = (item.get("reason_type") or "").strip() if status == "-" else ""
         reason_note = (item.get("reason_note") or "").strip() if status == "-" else ""
-        db.execute("""
-            INSERT INTO attendance (student_id, work_date, status, reason_type, reason_note, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(student_id, work_date) DO UPDATE SET
-                status = excluded.status,
-                reason_type = excluded.reason_type,
-                reason_note = excluded.reason_note,
-                updated_at = excluded.updated_at
-        """, (sid, work_date, status, reason_type, reason_note, now_str))
+        _upsert_attendance(db, sid, work_date, status, reason_type, reason_note, now_str)
     db.commit()
     return jsonify({"ok": True, "saved_count": len(items)})
 
@@ -2115,15 +2153,7 @@ def api_attendance():
 
     db = get_db()
     now_str = now_uz().strftime("%Y-%m-%d %H:%M:%S")
-    db.execute("""
-        INSERT INTO attendance (student_id, work_date, status, reason_type, reason_note, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(student_id, work_date) DO UPDATE SET
-            status = excluded.status,
-            reason_type = excluded.reason_type,
-            reason_note = excluded.reason_note,
-            updated_at = excluded.updated_at
-    """, (student_id, work_date, status, reason_type, reason_note, now_str))
+    _upsert_attendance(db, student_id, work_date, status, reason_type, reason_note, now_str)
     db.commit()
     return jsonify({"ok": True})
 
@@ -2151,14 +2181,15 @@ def set_phone_status():
         now_hm = now_dt.strftime("%H:%M")
         now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         phone_given = 1 if phone_status == "Berildi" else 0
-        db.execute("""
+        excl = "EXCLUDED" if USE_POSTGRES else "excluded"
+        db.execute(f"""
             INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_time, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(student_id, work_date) DO UPDATE SET
-                phone_status = excluded.phone_status,
-                phone_given = excluded.phone_given,
-                phone_time = excluded.phone_time,
-                updated_at = excluded.updated_at
+                phone_status = {excl}.phone_status,
+                phone_given = {excl}.phone_given,
+                phone_time = {excl}.phone_time,
+                updated_at = {excl}.updated_at
         """, (student_id, work_date, phone_status, phone_given, now_hm, now_str))
         db.commit()
         flash(f"Holat '{phone_status}' qilib belgilandi.", "success")
@@ -2176,16 +2207,17 @@ def set_all_phones_not_given():
     now_dt = now_uz()
     now_hm = now_dt.strftime("%H:%M")
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    excl = "EXCLUDED" if USE_POSTGRES else "excluded"
     students = db.execute("SELECT id FROM students").fetchall()
     for st in students:
-        db.execute("""
+        db.execute(f"""
             INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_time, updated_at)
             VALUES (?, ?, 'Biz bermadik', 0, ?, ?)
             ON CONFLICT(student_id, work_date) DO UPDATE SET
                 phone_status = 'Biz bermadik',
                 phone_given = 0,
-                phone_time = excluded.phone_time,
-                updated_at = excluded.updated_at
+                phone_time = {excl}.phone_time,
+                updated_at = {excl}.updated_at
         """, (st["id"], work_date, now_hm, now_str))
     db.commit()
     flash("Barcha o'quvchilarga 'Biz bermadik' belgilandi.", "success")
@@ -2222,15 +2254,16 @@ def save_phone_photo():
         now_hm = now_dt.strftime("%H:%M")
         now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         phone_given = 1 if phone_status == "Berildi" else 0
-        db.execute("""
+        excl = "EXCLUDED" if USE_POSTGRES else "excluded"
+        db.execute(f"""
             INSERT INTO attendance (student_id, work_date, phone_status, phone_given, phone_photo, phone_time, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(student_id, work_date) DO UPDATE SET
-                phone_status = excluded.phone_status,
-                phone_given = excluded.phone_given,
-                phone_photo = CASE WHEN excluded.phone_photo != '' THEN excluded.phone_photo ELSE attendance.phone_photo END,
-                phone_time = excluded.phone_time,
-                updated_at = excluded.updated_at
+                phone_status = {excl}.phone_status,
+                phone_given = {excl}.phone_given,
+                phone_photo = CASE WHEN {excl}.phone_photo != '' THEN {excl}.phone_photo ELSE attendance.phone_photo END,
+                phone_time = {excl}.phone_time,
+                updated_at = {excl}.updated_at
         """, (student_id, work_date, phone_status, phone_given, rel_photo, now_hm, now_str))
         db.commit()
         flash("Rasm va holat saqlandi.", "success")
@@ -2259,7 +2292,7 @@ def add_student():
     if full_name and class_name and room_id:
         db = get_db()
         room = db.execute("SELECT id, capacity FROM rooms WHERE id = ?", (room_id,)).fetchone()
-        occ = db.execute("SELECT COUNT(*) AS c FROM students WHERE room_id = ?", (room_id,)).fetchone()["c"]
+        occ = _scalar_count(db.execute("SELECT COUNT(*) AS c FROM students WHERE room_id = ?", (room_id,)).fetchone())
         if room and occ < room["capacity"]:
             db.execute(
                 "INSERT INTO students (full_name, class_name, room_id) VALUES (?, ?, ?)",
@@ -2359,11 +2392,12 @@ def superadmin_toggle_auto_theme():
         return guard
     val = "1" if request.form.get("auto_theme") == "1" else "0"
     work_date = request.form.get("work_date") or today_str()
+    excl = "EXCLUDED" if USE_POSTGRES else "excluded"
     db = get_db()
-    db.execute(
-        "INSERT INTO settings (key, value) VALUES ('auto_theme', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (val,)
-    )
+    db.execute(f"""
+        INSERT INTO settings (key, value) VALUES ('auto_theme', ?)
+        ON CONFLICT(key) DO UPDATE SET value = {excl}.value
+    """, (val,))
     db.commit()
     return redirect(url_for("superadmin_page", date=work_date))
 
